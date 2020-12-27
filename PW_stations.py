@@ -27,6 +27,8 @@ garner_path = work_yuval / 'garner'
 ims_path = work_yuval / 'IMS_T'
 gis_path = work_yuval / 'gis'
 sound_path = work_yuval / 'sounding'
+climate_path = work_yuval / 'climate'
+dem_path = work_yuval / 'AW3D30'
 phys_soundings = sound_path / 'bet_dagan_phys_sounding_2007-2019.nc'
 tela_zwd = work_yuval / 'gipsyx_results/tela_newocean/TELA_PPP_1996-2019.nc'
 jslm_zwd = work_yuval / 'gipsyx_results/jslm_newocean/JSLM_PPP_2001-2019.nc'
@@ -169,33 +171,125 @@ def PW_trend_analysis(path=work_yuval, anom=False, station='tela'):
     return pw_tsen
 
 
-def produce_gnss_pw_from_era5(era5_path=era5_path,
-                              glob_str='era5_PW_israel*.nc',
-                              pw_path=work_yuval, savepath=None):
+def produce_gnss_pw_from_uerra(era5_path=era5_path,
+                               glob_str='UERRA_TCWV_*.nc',
+                               pw_path=work_yuval, savepath=None):
     from aux_gps import path_glob
     import xarray as xr
-    filepath = path_glob(era5_path, glob_str)[0]
-    era5_pw = xr.open_dataarray(filepath)
-    gps = produce_geo_gps_stations(gis_path, plot=False)
+    from aux_gps import save_ncfile
+    udf = add_UERRA_xy_to_israeli_gps_coords(pw_path, era5_path)
+    files = path_glob(era5_path, glob_str)
+    uerra_list = [xr.open_dataset(file) for file in files]
+    ds_attrs = uerra_list[0].attrs
+    ds_list = []
+    for i, uerra in enumerate(uerra_list):
+        print('proccessing {}'.format(files[i].as_posix().split('/')[-1]))
+        st_list = []
+        for station in udf.index:
+            y = udf.loc[station, 'y']
+            x = udf.loc[station, 'x']
+            uerra_st = uerra['tciwv'].isel(y=y, x=x).reset_coords(drop=True)
+            uerra_st.name = station
+            uerra_st.attrs = uerra['tciwv'].attrs
+            uerra_st.attrs['lon'] = udf.loc[station, 'lon']
+            uerra_st.attrs['lat'] = udf.loc[station, 'lat']
+            st_list.append(uerra_st)
+        ds_st = xr.merge(st_list)
+        ds_list.append(ds_st)
+    ds = xr.concat(ds_list, 'time')
+    ds = ds.sortby('time')
+    ds.attrs = ds_attrs
+    ds_monthly = ds.resample(time='MS', keep_attrs=True).mean(keep_attrs=True)
+    if savepath is not None:
+        filename = 'GNSS_uerra_4xdaily_PW.nc'
+        save_ncfile(ds, savepath, filename)
+        filename = 'GNSS_uerra_monthly_PW.nc'
+        save_ncfile(ds_monthly, savepath, filename)
+    return ds
+
+
+def produce_PWV_flux_from_ERA5_UVQ(
+        path=era5_path,
+        savepath=None,
+        pw_path=work_yuval, return_magnitude=False):
+    import xarray as xr
+    from aux_gps import calculate_pressure_integral
+    from aux_gps import calculate_g
+    from aux_gps import save_ncfile
+    import numpy as np
+    ds = xr.load_dataset(era5_path / 'ERA5_UVQ_mm_israel_1979-2020.nc')
+    ds = ds.sel(expver=1).reset_coords(drop=True)
+    g = calculate_g(ds['latitude']).mean().item()
+    qu = calculate_pressure_integral(ds['q'] * ds['u'])
+    qv = calculate_pressure_integral(ds['q'] * ds['v'])
+    qu.name = 'qu'
+    qv.name = 'qv'
+    # convert to mm/sec units
+    qu = 100 * qu / (g * 1000)
+    qv = 100 * qv / (g * 1000)
+    # add attrs:
+    qu.attrs['units'] = 'mm/sec'
+    qv.attrs['units'] = 'mm/sec'
+    qu_gnss = produce_era5_field_at_gnss_coords(
+        qu, savepath=None, pw_path=pw_path)
+    qv_gnss = produce_era5_field_at_gnss_coords(
+        qv, savepath=None, pw_path=pw_path)
+    if return_magnitude:
+        qflux = np.sqrt(qu_gnss**2 + qv_gnss**2)
+        qflux.attrs['units'] = 'mm/sec'
+        return qflux
+    else:
+        return qu_gnss, qv_gnss
+
+
+def produce_era5_field_at_gnss_coords(era5_da, savepath=None,
+                                      pw_path=work_yuval):
+    import xarray as xr
+    print('reading ERA5 {} field.'.format(era5_da.name))
+    gps = produce_geo_gnss_solved_stations(plot=False)
     era5_pw_list = []
     for station in gps.index:
         slat = gps.loc[station, 'lat']
         slon = gps.loc[station, 'lon']
-        da = era5_pw.sel(lat=slat, lon=slon, method='nearest')
+        da = era5_da.sel(latitude=slat, longitude=slon, method='nearest')
         da.name = station
-        da.attrs['era5_lat'] = da.lat.values.item()
-        da.attrs['era5_lon'] = da.lon.values.item()
+        da.attrs['era5_lat'] = da.latitude.values.item()
+        da.attrs['era5_lon'] = da.longitude.values.item()
         da = da.reset_coords(drop=True)
         era5_pw_list.append(da)
     ds = xr.merge(era5_pw_list)
+    return ds
+
+
+def produce_gnss_pw_from_era5(era5_path=era5_path,
+                              glob_str='era5_TCWV_israel*.nc',
+                              pw_path=work_yuval, savepath=None):
+    from aux_gps import path_glob
+    import xarray as xr
+    from aux_gps import save_ncfile
+    filepath = path_glob(era5_path, glob_str)[0]
+    print('opening ERA5 file {}'.format(filepath.as_posix().split('/')[-1]))
+    era5_pw = xr.open_dataarray(filepath)
+    era5_pw = era5_pw.sortby('time')
+    gps = produce_geo_gnss_solved_stations(plot=False)
+    era5_pw_list = []
+    for station in gps.index:
+        slat = gps.loc[station, 'lat']
+        slon = gps.loc[station, 'lon']
+        da = era5_pw.sel(latitude=slat, longitude=slon, method='nearest')
+        da.name = station
+        da.attrs['era5_lat'] = da.latitude.values.item()
+        da.attrs['era5_lon'] = da.longitude.values.item()
+        da = da.reset_coords(drop=True)
+        era5_pw_list.append(da)
+    ds_hourly = xr.merge(era5_pw_list)
+    ds_monthly = ds_hourly.resample(time='MS', keep_attrs=True).mean(keep_attrs=True)
     if savepath is not None:
         filename = 'GNSS_era5_hourly_PW.nc'
-        print('saving {} to {}'.format(filename, savepath))
-        comp = dict(zlib=True, complevel=9)  # best compression
-        encoding = {var: comp for var in ds}
-        ds.to_netcdf(savepath / filename, 'w', encoding=encoding)
-    print('Done!')
-    return ds
+        save_ncfile(ds_hourly, savepath, filename)
+        filename = 'GNSS_era5_monthly_PW.nc'
+        save_ncfile(ds_monthly, savepath, filename)
+    return ds_hourly
 
 
 def plug_in_approx_loc_gnss_stations(log_path=logs_path, file_path=cwd):
@@ -295,6 +389,41 @@ def build_df_lat_lon_alt_gnss_stations(gnss_path=GNSS, savepath=None):
         filename = 'israeli_gnss_coords.txt'
         df.to_csv(savepath/filename, sep=' ')
     return df
+
+
+def produce_homogeniety_results_xr(ds, alpha=0.05, test='snht', sim=20000):
+    import pyhomogeneity as hg
+    import xarray as xr
+    from aux_gps import homogeneity_test_xr
+    hg_tests_dict = {
+        'snht': hg.snht_test,
+        'pett': hg.pettitt_test,
+        'b_like': hg.buishand_likelihood_ratio_test,
+        'b_u': hg.buishand_u_test,
+        'b_q': hg.buishand_q_test,
+        'b_range': hg.buishand_range_test}
+    if test == 'all':
+        tests = [x for x in hg_tests_dict.keys()]
+        ds_list = []
+        for t in tests:
+            print('running {} test...'.format(t))
+            rds = ds.map(homogeneity_test_xr, hg_test_func=hg_tests_dict[t],
+                         alpha=alpha, sim=sim, verbose=False)
+            rds = rds.to_array('station').to_dataset('results')
+            ds_list.append(rds)
+        rds = xr.concat(ds_list, 'test')
+        rds['test'] = tests
+        rds.attrs['alpha'] = alpha
+        rds.attrs['sim'] = sim
+    else:
+        rds = ds.map(homogeneity_test_xr, hg_test_func=hg_tests_dict[test],
+                     alpha=alpha, sim=sim, verbose=False)
+        rds = rds.to_array('station').to_dataset('results')
+        rds.attrs['alpha'] = alpha
+        rds.attrs['sim'] = sim
+#    df=rds.to_array('st').to_dataset('results').to_dataframe()
+    print('Done!')
+    return rds
 
 
 def run_error_analysis(station='tela', task='edit30hr'):
@@ -1045,7 +1174,7 @@ def produce_pw_statistics(path=work_yuval, resample_to_mm=True, thresh=50,
         'index').to_dataframe('Kurtosis')
     df = pd.concat([mean, std, median, q5, q95,
                     maximum, minimum, sk, kurt], axis=1)
-    cols=[]
+    cols = []
     cols.append('Site ID')
     cols += [x for x in df.columns]
     df['Site ID'] = df.index.str.upper()
@@ -1056,10 +1185,13 @@ def produce_pw_statistics(path=work_yuval, resample_to_mm=True, thresh=50,
 
 def produce_geo_gnss_solved_stations(path=gis_path,
                                      file='israeli_gnss_coords.txt',
+                                     add_distance_to_coast=False,
+                                     climate_path=None,
                                      plot=True):
     import geopandas as gpd
     import pandas as pd
     from pathlib import Path
+    from ims_procedures import get_israeli_coast_line
     cwd = Path().cwd()
     df = pd.read_csv(cwd / file, delim_whitespace=True)
     df = df[['lat', 'lon', 'alt', 'name']]
@@ -1068,6 +1200,57 @@ def produce_geo_gnss_solved_stations(path=gis_path,
     stations = gpd.GeoDataFrame(df, geometry=gpd.points_from_xy(df.lon,
                                                                 df.lat),
                                 crs=isr.crs)
+    if add_distance_to_coast:
+        isr_coast = get_israeli_coast_line(path=path)
+        coast_lines = [isr_coast.to_crs(
+            'epsg:2039').loc[x].geometry for x in isr_coast.index]
+        for station in stations.index:
+            point = stations.to_crs('epsg:2039').loc[station, 'geometry']
+            stations.loc[station, 'distance'] = min(
+                [x.distance(point) for x in coast_lines]) / 1000.0
+    # define groups for longterm analysis, north to south, west to east:
+    coastal_dict = {
+        key: 0 for (key) in [
+            'kabr',
+            'bshm',
+            'csar',
+            'tela',
+            'alon',
+            'slom']}
+    highland_dict = {key: 1 for (key) in
+                     ['nzrt', 'mrav', 'yosh', 'jslm', 'klhv', 'yrcm', 'ramo']}
+    eastern_dict = {key: 2 for (key) in
+                    ['elro', 'katz', 'drag', 'dsea', 'nrif', 'elat']}
+    groups_dict = {**coastal_dict, **highland_dict, **eastern_dict}
+    stations['groups_annual'] = pd.Series(groups_dict)
+    # define groups with climate code
+    gr1_dict = {
+        key: 0 for (key) in [
+            'kabr',
+            'bshm',
+            'csar',
+            'tela',
+            'alon',
+            'nzrt',
+            'mrav',
+            'yosh',
+            'jslm',
+            'elro',
+            'katz']}
+    gr2_dict = {key: 1 for (key) in
+                ['slom', 'klhv', 'yrcm', 'drag']}
+    gr3_dict = {key: 2 for (key) in
+                ['ramo', 'dsea', 'nrif', 'elat']}
+    groups_dict = {**gr1_dict, **gr2_dict, **gr3_dict}
+    stations['groups_climate'] = pd.Series(groups_dict)
+    if climate_path is not None:
+        cc = pd.read_csv(climate_path / 'gnss_station_climate_code.csv',
+                         index_col='station')
+        stations = stations.join(cc)
+
+#    cc, ccc = assign_climate_classification_to_gnss(path=climate_path)
+#    stations['climate_class'] = cc
+#    stations['climate_code'] = ccc
     if plot:
         ax = isr.plot()
         stations.plot(ax=ax, column='alt', cmap='Greens',
@@ -1077,6 +1260,35 @@ def produce_geo_gnss_solved_stations(path=gis_path,
             ax.annotate(label, xy=(x, y), xytext=(3, 3),
                         textcoords="offset points")
     return stations
+
+
+def add_UERRA_xy_to_israeli_gps_coords(path=work_yuval, era5_path=era5_path):
+    import xarray as xr
+    from aux_gps import path_glob
+    from aux_gps import get_nearest_lat_lon_for_xy
+    import pandas as pd
+    from aux_gps import calculate_distance_between_two_lat_lon_points
+    file = path_glob(era5_path, 'UERRA*.nc')[0]
+    uerra = xr.open_dataset(file)
+    ulat = uerra['latitude']
+    ulon = uerra['longitude']
+    df = produce_geo_gnss_solved_stations(
+        plot=False, add_distance_to_coast=True)
+    points = df[['lat', 'lon']].values
+    xy = get_nearest_lat_lon_for_xy(ulat, ulon, points)
+    udf = pd.DataFrame(xy, index=df.index, columns=['y', 'x'])
+    udf['lat'] = [ulat.isel(y=xi, x=yi).item() for (xi, yi) in xy]
+    udf['lon'] = [ulon.isel(y=xi, x=yi).item() for (xi, yi) in xy]
+    ddf = calculate_distance_between_two_lat_lon_points(
+        df['lat'],
+        df['lon'],
+        udf['lat'],
+        udf['lon'],
+        orig_epsg='4326',
+        meter_epsg='2039')
+    ddf /= 1000  # distance in km
+    udf['distance_to_orig'] = ddf
+    return udf
 
 
 def produce_geo_gps_stations(path=gis_path, file='All_gps_stations.txt',
@@ -1261,10 +1473,14 @@ def produce_geo_df(gis_path=gis_path, plot=True):
 
 def save_GNSS_PW_israeli_stations(path=work_yuval, ims_path=ims_path,
                                   savepath=work_yuval, mda=None,
-                                  model_name='TSEN', thresh=50):
+                                  model_name='TSEN', thresh=50,
+                                  extra_name=None):
     import xarray as xr
     from aux_gps import path_glob
-    file = path_glob(path, 'ZWD_thresh_{:.0f}.nc'.format(thresh))[0]
+    if extra_name is not None:
+        file = path_glob(path, 'ZWD_thresh_{:.0f}_{}.nc'.format(thresh, extra_name))[0]
+    else:
+        file = path_glob(path, 'ZWD_thresh_{:.0f}.nc'.format(thresh))[0]
     zwd = xr.load_dataset(file)
     print('loaded {} file as ZWD.'.format(file.as_posix().split('/')[-1]))
     file = sorted(path_glob(ims_path, 'GNSS_5mins_TD_ALL_*.nc'))[-1]
@@ -1281,7 +1497,10 @@ def save_GNSS_PW_israeli_stations(path=work_yuval, ims_path=ims_path,
     ds = xr.merge(ds_list)
     ds.attrs.update(zwd.attrs)
     if savepath is not None:
-        filename = 'GNSS_PW_thresh_{:.0f}.nc'.format(thresh)
+        if extra_name is not None:
+            filename = 'GNSS_PW_thresh_{:.0f}_{}.nc'.format(thresh, extra_name)
+        else:
+            filename = 'GNSS_PW_thresh_{:.0f}.nc'.format(thresh)
         print('saving {} to {}'.format(filename, savepath))
         comp = dict(zlib=True, complevel=9)  # best compression
         encoding = {var: comp for var in ds.data_vars}
@@ -1858,6 +2077,20 @@ def kappa(T, Tmul=0.72, T_offset=70.2, k2=22.1, k3=3.776e5, Tm_input=False):
     return k
 
 
+def calculate_ZHD(pressure, lat=30.0, ht_km=0.5):
+    import numpy as np
+    import xarray as xr
+    lat_rad = np.deg2rad(lat)
+    ZHD = 0.22794 * pressure / \
+        (1 - 0.00266 * np.cos(2 * lat_rad) - 0.00028 * ht_km)
+    if not isinstance(ZHD, xr.DataArray):
+        ZHD = xr.DataArray(ZHD, dims=['time'])
+    ZHD.name = 'ZHD'
+    ZHD.attrs['units'] = 'cm'
+    ZHD.attrs['long_name'] = 'Zenith Hydrostatic Delay'
+    return ZHD
+
+
 def minimize_kappa_tela_sound(sound_path=sound_path, gps=garner_path,
                               ims_path=ims_path, station='TELA', bounds=None,
                               x0=None, times=None, season=None):
@@ -1972,6 +2205,16 @@ def read_zwd_from_tdp_final(tdp_path, st_name='TELA', scatter_plot=True):
         ds[st_name].plot.line(marker='.', linewidth=0.)
         # plt.scatter(x=ds.time.values, y=ds.TELA.values, marker='.', s=10)
     return ds
+
+
+def read_rnx_headers(path=work_yuval/'rnx_headers', station='tela'):
+    from aux_gps import path_glob
+    import pandas as pd
+    file = path_glob(path, '{}_rnxheaders.csv'.format(station))[0]
+    df = pd.read_csv(file, header=0, index_col='nameDateStr')
+    df = df.sort_index()
+    df = df.drop('Unnamed: 0', axis=1)
+    return df
 
 
 def check_anton_tela_station(anton_path, ims_path=ims_path, plot=True):
@@ -2965,11 +3208,43 @@ def israeli_gnss_stations_long_term_trend_analysis(
 #    return exp_dict
 
 
+def calculate_diurnal_variability(path=work_yuval, with_amp=False):
+    import xarray as xr
+    import pandas as pd
+    import numpy as np
+    pw_anoms = xr.load_dataset(
+        work_yuval /
+        'GNSS_PW_thresh_50_for_diurnal_analysis_removed_daily.nc')
+    pw = xr.load_dataset(
+        work_yuval /
+        'GNSS_PW_thresh_50_for_diurnal_analysis.nc')
+    pw_anoms = pw_anoms[[x for x in pw_anoms if '_error' not in x]]
+    pw = pw[[x for x in pw if '_error' not in x]]
+    amp = np.abs(pw_anoms.groupby('time.hour').mean()).max()
+    pd.options.display.float_format = '{:.1f}'.format
+    df = 100.0 * (amp / pw.mean()
+                  ).to_array('station').to_dataframe('amplitude_to_mean_ratio')
+    if with_amp:
+        df['amplitude'] = amp.to_array('station').to_dataframe('amplitude')
+    seasons = ['JJA', 'SON', 'DJF', 'MAM']
+    for season in seasons:
+        season_mean = pw.sel(time=pw['time.season'] == season).mean()
+        season_anoms = pw_anoms.sel(time=pw_anoms['time.season'] == season)
+        diff_season = np.abs(season_anoms.groupby('time.hour').mean()).max()
+        df['amplitude_to_mean_ratio{}'.format(season)] = 100.0 * (diff_season / season_mean).to_array(
+            'station').to_dataframe('amplitude_to_mean_ratio_{}'.format(season))
+        if with_amp:
+            df['amplitude_{}'.format(season)] = diff_season.to_array(
+                'station').to_dataframe('amplitude_{}'.format(season))
+    return df
+
+
 def perform_harmonic_analysis_all_GNSS(path=work_yuval, n=6,
                                        savepath=work_yuval):
     import xarray as xr
     from aux_gps import harmonic_analysis_xr
-    pw = xr.load_dataset(path / 'GNSS_PW_anom_50_removed_daily.nc')
+    from aux_gps import save_ncfile
+    pw = xr.load_dataset(path / 'GNSS_PW_anom_50_for_diurnal_analysis_removed_daily.nc')
     dss_list = []
     for site in pw:
         print('performing harmonic analysis for GNSS {} site:'.format(site))
@@ -2981,10 +3256,7 @@ def perform_harmonic_analysis_all_GNSS(path=work_yuval, n=6,
     dss_all.attrs['units'] = 'mm'
     if savepath is not None:
         filename = 'GNSS_PW_harmonics_diurnal.nc'
-        comp = dict(zlib=True, complevel=9)  # best compression
-        encoding = {var: comp for var in dss_all.data_vars}
-        dss_all.to_netcdf(savepath / filename, 'w', encoding=encoding)
-        print('Done!')
+        save_ncfile(dss_all, savepath, filename)
     return dss_all
 
 
@@ -3016,7 +3288,8 @@ def produce_GNSS_fft_diurnal(path=work_yuval, savepath=work_yuval, plot=False):
     diurnal and sub-diurnal harmonics, and save them"""
     from aux_gps import fft_xr
     import xarray as xr
-    pw = xr.load_dataset(path / 'GNSS_PW_anom_50_removed_daily.nc')
+    pw = xr.load_dataset(path / 'GNSS_PW_thresh_50_for_diurnal_analysis.nc')
+    pw = pw[[x for x in pw if '_error' not in x]]
     fft_list = []
     for station in pw:
         da = fft_xr(pw[station], nan_fill='zero', user_freq=None, units='cpd',
@@ -3099,26 +3372,31 @@ def GNSS_pw_to_X_using_window(gnss_path=work_yuval, hydro_path=hydro_path,
 def produce_all_GNSS_PW_anomalies(load_path=work_yuval, thresh=50,
                                   grp1='hour', grp2='dayofyear',
                                   remove_daily_only=False,
-                                  savepath=work_yuval):
+                                  savepath=work_yuval, extra_name=None):
     import xarray as xr
-    from aux_gps import groupby_date_xr
-    GNSS_pw = xr.open_dataset(load_path / 'GNSS_PW_thresh_{:.0f}_homogenized.nc'.format(thresh))
+    from aux_gps import anomalize_xr
+    if extra_name is not None:
+        GNSS_pw = xr.open_dataset(load_path / 'GNSS_PW_thresh_{:.0f}_{}.nc'.format(thresh, extra_name))
+    else:
+        GNSS_pw = xr.open_dataset(load_path / 'GNSS_PW_thresh_{:.0f}_homogenized.nc'.format(thresh))
     anom_list = []
     stations_only = [x for x in GNSS_pw.data_vars if '_error' not in x]
     for station in stations_only:
         pw = GNSS_pw[station]
         if remove_daily_only:
             print('{}'.format(station))
-            date = groupby_date_xr(pw)
-            pw_anom = pw.groupby(date) - pw.groupby(date).mean('time')
-            pw_anom = pw_anom.reset_coords(drop=True)
+            pw_anom = anomalize_xr(pw, 'D')
         else:
             pw_anom = produce_PW_anomalies(pw, grp1, grp2, False)
         anom_list.append(pw_anom)
     GNSS_pw_anom = xr.merge(anom_list)
     if savepath is not None:
         if remove_daily_only:
-            filename = 'GNSS_PW_anom_{:.0f}_removed_daily.nc'.format(thresh)
+            if extra_name is not None:
+                filename = 'GNSS_PW_thresh_{:.0f}_{}_removed_daily.nc'.format(thresh, extra_name)
+            else:
+                filename = 'GNSS_PW_thresh_{:.0f}_removed_daily.nc'.format(thresh)
+            GNSS_pw_anom.attrs['action'] = 'removed daily means'
         else:
             filename = 'GNSS_PW_anom_{:.0f}_{}_{}.nc'.format(thresh, grp1, grp2)
         comp = dict(zlib=True, complevel=9)  # best compression
@@ -3355,7 +3633,8 @@ def filter_month_year_data_heatmap_plot(da_ts, freq='5T', thresh=50.0,
 #    return da
 
 
-def calculate_zwd_altitude_fit(path=work_yuval, model='TSEN', plot=True):
+def calculate_zwd_altitude_fit(path=work_yuval, model='TSEN', plot=True,
+                               fontsize=14):
     from PW_stations import produce_geo_gnss_solved_stations
     import xarray as xr
     from PW_stations import ML_Switcher
@@ -3392,13 +3671,14 @@ def calculate_zwd_altitude_fit(path=work_yuval, model='TSEN', plot=True):
     if plot:
         fig, ax_lapse = plt.subplots(figsize=(10, 6))
         sns.regplot(x=alt, y=zwd_vals, color='r',
-                    scatter_kws={'color': 'b'}, x_estimator=np.mean, ax=ax_lapse)
-        ax_lapse.set_xlabel('Altitude [m]')
-        ax_lapse.set_ylabel('Zenith Wet Delay [cm]')
+                    scatter_kws={'color': 'k'}, x_estimator=np.mean, ax=ax_lapse)
+        ax_lapse.set_xlabel('Altitude [m]', fontsize=fontsize)
+        ax_lapse.set_ylabel('Zenith Wet Delay [cm]', fontsize=fontsize)
         ax_lapse.text(0.5, 0.95, 'Lapse rate: {:.2f} cm/km'.format(zwd_lapse_rate),
                       horizontalalignment='center', verticalalignment='center',
-                      transform=ax_lapse.transAxes, fontsize=12, color='k',
+                      transform=ax_lapse.transAxes, fontsize=fontsize, color='k',
                       fontweight='bold')
+        ax_lapse.tick_params(labelsize=fontsize)
         ax_lapse.grid()
 #        fig, ax = plt.subplots(1, 1, figsize=(16, 4))
 #        ax.errorbar(x=alt, y=zwd_vals, yerr=zwd_std_vals,
@@ -3421,10 +3701,11 @@ def calculate_zwd_altitude_fit(path=work_yuval, model='TSEN', plot=True):
 def select_PPP_field_thresh_and_combine_save_all(
         path=work_yuval, thresh=None, to_drop=['hrmn', 'nizn', 'spir'],
         combine_dict={'klhv': ['klhv', 'lhav'], 'mrav': ['gilb', 'mrav']},
-        field='ZWD'):
+        field='ZWD', extra_name=None):
     import xarray as xr
     import numpy as np
     from aux_gps import path_glob
+    df = produce_geo_gnss_solved_stations(plot=False)
     file = path_glob(path, '{}_unselected*.nc'.format(field.upper()))[0]
     ds = xr.load_dataset(file)
     zwd_thresh = ds.map(
@@ -3474,7 +3755,13 @@ def select_PPP_field_thresh_and_combine_save_all(
     zwd_thresh.attrs['mean_days_dropped_percent'] = '{:.2f}'.format(mean_days_dropped_percent)
     zwd_thresh.attrs['mean_months_dropped_percent'] = '{:.2f}'.format(mean_months_dropped_percent)
     zwd_thresh = zwd_thresh[sorted(zwd_thresh)]
-    filename = '{}_thresh_{:.0f}.nc'.format(field.upper(), thresh)
+    # update attrs:
+    for zwd in [x for x in zwd_thresh if '_error' not in x]:
+        zwd_thresh[zwd].attrs.update(df.loc[zwd, ['lat', 'lon', 'alt', 'name']].to_dict())
+    if extra_name is not None:
+        filename = '{}_thresh_{:.0f}_{}.nc'.format(field.upper(), thresh, extra_name)
+    else:
+        filename = '{}_thresh_{:.0f}.nc'.format(field.upper(), thresh)
     comp = dict(zlib=True, complevel=9)  # best compression
     encoding = {var: comp for var in zwd_thresh.data_vars}
     zwd_thresh.to_netcdf(path / filename, 'w', encoding=encoding)
@@ -3734,27 +4021,19 @@ def pettitt_test_on_pw(da_ts, sample=None, alpha=0.05):
 #    a=[loc; K ;pvalue];
     return 
 
-def normality_test_on_pw(da_ts, sample=None, alpha=0.05, test='shapiro'):
-    from statsmodels.stats.diagnostic import lilliefors
-    from scipy.stats import shapiro
-    if sample is not None:
-        da_ts = da_ts.resample(time=sample).mean()
-    if test == 'shapiro':
-        mean, pvalue = shapiro(da_ts.dropna('time'))
-    else:
-        mean, pvalue = lilliefors(da_ts.dropna('time'))
-    if pvalue < alpha:
-        return 'Not Normally distributed with alpha {}'.format(alpha)
-    else:
-        return 'Normally distributed with alpha {}'.format(alpha)
-
-
 def mann_kendall_trend_analysis(da_ts, alpha=0.05, seasonal=False, CI=False,
-                                verbose=True):
+                                season_selection=None, verbose=True):
     import pymannkendall as mk
     from scipy.stats.mstats import theilslopes
     import numpy as np
     import pandas as pd
+    if season_selection is not None:
+        if verbose:
+            print('{} season selected.'.format(season_selection))
+        da_ts = da_ts.sel(time=da_ts['time.season']==season_selection)
+    else:
+        if verbose:
+            print('No specific season is selected.')
     if seasonal:
         result = mk.seasonal_test(da_ts, alpha=alpha)
         test = 'Seasonal Mann Kendall Test'
@@ -3770,9 +4049,97 @@ def mann_kendall_trend_analysis(da_ts, alpha=0.05, seasonal=False, CI=False,
     if CI:
         masked = np.ma.masked_array(da_ts, mask=np.isnan(da_ts))
         slope, inter, conf_lo, conf_up = theilslopes(y=masked, alpha=alpha)
-        mkt['CI_95'] = [conf_lo, conf_up]
+        confi_per = int((1-alpha) * 100)
+        mkt['CI_{}_low'.format(confi_per)] = conf_lo
+        mkt['CI_{}_high'.format(confi_per)] = conf_up
     # da_ts.attrs.update(mkt)
     return pd.Series(mkt)
+
+
+def process_mkt_from_dataset(ds_in, alpha=0.05, seasonal=False, factor=120,
+                season_selection=None, anomalize=True, CI=False):
+    """because the data is in monthly means and the output is #/decade,
+    the factor is 12 months a year and 10 years in a decade yielding 120,
+    input is xr.Dataset of monthly means (for now)"""
+    from aux_gps import anomalize_xr
+    if anomalize:
+        ds_in = anomalize_xr(ds_in, 'MS', verbose=False)
+    ds = ds_in.map(
+        mann_kendall_trend_analysis,
+        alpha=alpha,
+        seasonal=seasonal,
+        verbose=False, season_selection=season_selection, CI=CI)
+    ds = ds.rename({'dim_0': 'mkt'})
+    df = ds.to_dataframe().T
+    df = df.drop(['test_name', 'trend', 'h', 'z', 's', 'var_s'], axis=1)
+    df.index.name = ''
+    df.columns.name = ''
+    df['slope'] = df['slope'] * factor
+    if CI:
+        ci_cols = [x for x in df.columns if 'CI' in x]
+        df[ci_cols] = df[ci_cols] * factor
+    return df
+
+
+def fill_pwv_station(pw_da, method='cubic', max_gap=6, daily=False, plot=False,
+                     verbose=True):
+    from aux_gps import anomalize_xr
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if verbose:
+        print(
+            'using {} interpolation with max gap of {} months.'.format(
+                method,
+                max_gap))
+    longterm_mm = pw_da.groupby('time.month').mean(keep_attrs=True)
+    pw_anom = anomalize_xr(pw_da, 'MS')
+    if daily:
+        max_gap_td = np.timedelta64(max_gap, 'D')
+    else:
+        max_gap_td = np.timedelta64(max_gap, 'M')
+    filled = pw_anom.interpolate_na('time', method=method, max_gap=max_gap_td)
+    reconstructed = filled.groupby('time.month') + longterm_mm
+    reconstructed = reconstructed.reset_coords(drop=True)
+    reconstructed.attrs = pw_da.attrs
+    reconstructed.attrs['action'] = 'interpolated using {} method'.format(
+        method)
+    if daily:
+        reconstructed.attrs['max_gap'] = '{} days'.format(max_gap)
+    else:
+        reconstructed.attrs['max_gap'] = '{} months'.format(max_gap)
+    if plot:
+        filledln = reconstructed.plot.line('b-')
+        origln = pw_da.plot.line('r-')
+        ax = plt.gca()
+        ax.legend(origln + filledln,
+                  ['original time series',
+                   'filled using {} interpolation with max gap of {} months'.format(method,
+                                                                                    max_gap)])
+        ax.grid()
+        ax.set_xlabel('')
+        ax.set_ylabel('PWV [mm]')
+        ax.set_title('PWV station {}'.format(pw_da.name.upper()))
+    return reconstructed
+
+
+def fill_pwv_stations_and_choose_largest_epoch(pw_ds, method='cubic',
+                                               max_gap=5, savepath=None,
+                                               daily=False, plot=True):
+    from aux_gps import grab_n_consecutive_epochs_from_ts
+    from aux_gps import gantt_chart
+    pw_filled = pw_ds.map(
+        fill_pwv_station,
+        max_gap=max_gap,
+        method=method,
+        verbose=False,
+        plot=False)
+    pw_filled_largest = pw_filled.map(
+        grab_n_consecutive_epochs_from_ts,
+        return_largest=True)
+    if plot:
+        gantt_chart(pw_ds)
+        gantt_chart(pw_filled_largest)
+    return pw_filled_largest
 
 
 def homogenize_pw_dataset(path=work_yuval, thresh=50, savepath=work_yuval):
@@ -3904,7 +4271,33 @@ def get_p_values(X, y):
     pval = np.empty((X.shape))
     f, pval[:] = f_regression(X, y)
     return pval
-#def analyze_sounding_and_formulate(sound_path=sound_path,
+
+
+def read_gps_axis_xlsx(path=work_yuval, field='ZWD'):
+    import pandas as pd
+    import xarray as xr
+    tlv = pd.read_excel(path/'IPWV-SHLOMI.XLSX', sheet_name='TLV')
+    tlv.set_index('EventTime', inplace=True)
+    tlv.index.name = 'time'
+    tlv_da = tlv.to_xarray()[field] * 100.0
+    tlv_da.name = 'tela_axis'
+    jrslm = pd.read_excel(path/'IPWV-SHLOMI.XLSX', sheet_name='JRSLM')
+    jrslm.set_index('EventTime', inplace=True)
+    jrslm.index.name = 'time'
+    jrslm_da = jrslm.to_xarray()[field] * 100.0
+    jrslm_da.name = 'jslm_axis'
+    eilat = pd.read_excel(path/'IPWV-SHLOMI.XLSX', sheet_name='Eilat')
+    eilat.set_index('EventTime', inplace=True)
+    eilat.index.name = 'time'
+    eilat_da = eilat.to_xarray()[field] * 100.0
+    eilat_da.name = 'elat_axis'
+    ds = xr.merge([tlv_da, jrslm_da, eilat_da])
+    return ds
+
+
+   
+#def analyze_sounding_and_formulatxe(sound_path=sound_path,
+    
 #                                   model_names = ['TSEN', 'LR'],
 #                                   res_save='LR'):
 #    import xarray as xr

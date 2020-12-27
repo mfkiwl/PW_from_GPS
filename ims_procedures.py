@@ -44,6 +44,43 @@ ims_units_dict = {
     'G': ''}
 
 
+def produce_bet_dagan_long_term_pressure(path=ims_path, rate='1H',
+                                         savepath=None):
+    import xarray as xr
+    from aux_gps import xr_reindex_with_date_range
+    from aux_gps import get_unique_index
+    from aux_gps import save_ncfile
+    # load manual old measurements and new 3 hr ones:
+    bd_man = xr.open_dataset(
+        path / 'IMS_hourly_03hr.nc')['BET-DAGAN-MAN_2520_ps']
+    bd_auto = xr.open_dataset(path / 'IMS_hourly_03hr.nc')['BET-DAGAN_2523_ps']
+    bd = xr.concat(
+        [bd_man.dropna('time'), bd_auto.dropna('time')], 'time', join='inner')
+    bd = get_unique_index(bd)
+    bd = bd.sortby('time')
+    bd = xr_reindex_with_date_range(bd, freq='1H')
+    bd_inter = bd.interpolate_na('time', max_gap='3H', method='cubic')
+    # load 10-mins new measurements:
+    bd_10 = xr.open_dataset(path / 'IMS_BP_israeli_hourly.nc')['BET-DAGAN']
+    bd_10 = bd_10.dropna('time').sel(
+        time=slice(
+            '2019-06-30T00:00:00',
+            None)).resample(
+                time='1H').mean()   
+    bd_inter = xr.concat([bd_inter, bd_10], 'time', join='inner')
+    bd_inter = get_unique_index(bd_inter)
+    bd_inter = bd_inter.sortby('time')
+    bd_inter.name = 'bet-dagan'
+    bd_inter.attrs['action'] = 'interpolated from 3H'
+    if savepath is not None:
+        filename = 'IMS_BD_hourly_ps.nc'
+        yr_min = bd_inter.time.min().dt.year.item()
+        yr_max = bd_inter.time.max().dt.year.item()
+        filename = 'IMS_BD_hourly_ps_{}-{}.nc'.format(yr_min, yr_max)
+        save_ncfile(bd_inter, savepath, filename)
+    return bd_inter
+
+
 def transform_wind_speed_direction_to_u_v(path=ims_path, savepath=ims_path):
     import xarray as xr
     import numpy as np
@@ -58,8 +95,10 @@ def transform_wind_speed_direction_to_u_v(path=ims_path, savepath=ims_path):
         attrs = WS[station].attrs
         attrs.update(channel_name='U')
         attrs.update(units='m/s')
+        attrs.update(field_name='zonal velocity')
         U[station].attrs = attrs
         attrs.update(channel_name='V')
+        attrs.update(field_name='meridional velocity')
         V[station].attrs = attrs
     if savepath is not None:
         filename = 'IMS_U_israeli_10mins.nc'
@@ -425,6 +464,19 @@ def produce_relative_frequency_wind_direction(path=ims_path,
     return Q_freq
 
 
+def get_israeli_coast_line(path=gis_path, minx=34.0, miny=30.0, maxx=36.0,
+                           maxy=34.0):
+    from shapely.geometry import box
+    import geopandas as gpd
+    # create bounding box using shapely:
+    bbox = box(minx, miny, maxx, maxy)
+    # read world coast lines:
+    coast = gpd.read_file(gis_path / 'ne_10m_coastline.shp')
+    # clip:
+    gdf = gpd.clip(coast, bbox)
+    return gdf
+
+
 def clip_raster(fp=awd_path/'Israel_Area.tif',
                 out_tif=awd_path/'israel_dem.tif',
                 minx=34.0, miny=29.0, maxx=36.5, maxy=34.0):
@@ -589,8 +641,13 @@ def IMS_interpolating_to_GNSS_stations_israel(dt='2013-10-19T22:00:00',
         # Tloc_df = Tloc_df.dropna(axis=0)
         ts_vs_alt = pd.Series(ts.values, index=T_alts)
         ts_vs_alt_for_fit = ts_vs_alt.dropna()
+#        try:
         [a, b] = np.polyfit(ts_vs_alt_for_fit.index.values,
                             ts_vs_alt_for_fit.values, 1)
+#        except TypeError as e:
+#            print('{}, dt: {}'.format(e, dt))
+#            print(ts_vs_alt)
+#            return 
         if lapse_rate == 'auto':
             lapse_rate = np.abs(a) * 1000
             if lapse_rate < 5.0:
@@ -1369,41 +1426,111 @@ def proccess_hourly_ims_climate_database(path=ims_path, var='tas',
     return ds
 
 
-def read_hourly_ims_climate_database(path=ims_path / 'ground',
-                                     savepath=None):
+def read_all_hourly_ims_climate_database(path=ims_path / 'hourly', freq='03',
+                                         savepath=None):
     """downloaded from tau...ds is a dataset of all stations,
     times is a time period"""
-    import pandas as pd
     import xarray as xr
-    from aux_gps import print_saved_file
-    da_list = []
-    for file in sorted(path.glob('*.csv')):
-        name = file.as_posix().split('/')[-1].split('_')[0]
-        sid = file.as_posix().split('/')[-1].split('_')[1]
-        array_name = '_'.join([name, sid])
-        print('reading {} station...'.format(array_name))
-        df = pd.read_csv(file, index_col='time')
-        df.index = pd.to_datetime(df.index)
-        df.drop(labels=['Unnamed: 0', 'name'], axis=1, inplace=True)
-        lat = df.loc[:, 'lat'][0]
-        lon = df.loc[:, 'lon'][0]
-        height = df.loc[:, 'height'][0]
-        df.drop(labels=['lat', 'lon', 'height'], axis=1, inplace=True)
-        da = df.to_xarray().to_array(dim='var')
-        da.name = array_name
-        da.attrs['station_id'] = sid
-        da.attrs['lat'] = lat
-        da.attrs['lon'] = lon
-        da.attrs['height'] = height
-        da_list.append(da)
-    ds = xr.merge(da_list)
+    from aux_gps import save_ncfile
+    ds_list = []
+    for file in sorted(path.glob('*_{}hr_*.csv'.format(freq))):
+        ds = read_one_ims_hourly_station_csv(file)
+        ds_list.append(ds)
+    dss = xr.merge(ds_list)
     print('Done!')
     if savepath is not None:
-        comp = dict(zlib=True, complevel=9)  # best compression
-        encoding = {var: comp for var in ds.data_vars}
-        ds.to_netcdf(savepath / 'hourly_ims.nc', 'w', encoding=encoding)
-        print_saved_file('hourly_ims.nc', savepath)
+        save_ncfile(dss, savepath, filename='IMS_hourly_{}hr.nc'.format(freq))
+    return dss
+
+
+def read_one_ims_hourly_station_csv(file):
+    import pandas as pd
+    from aux_gps import xr_reindex_with_date_range
+    from aux_gps import rename_data_vars
+    name = file.as_posix().split('/')[-1].split('_')[0]
+    sid = file.as_posix().split('/')[-1].split('_')[1]
+    freq = file.as_posix().split('/')[-1].split('_')[2]
+    freq = ''.join([x for x in freq if x.isdigit()]) + 'H'
+    array_name = '_'.join([name, sid])
+    print('reading {} station...'.format(array_name))
+    df = pd.read_csv(file, index_col='time')
+    df.index = pd.to_datetime(df.index)
+    df.drop(labels=['Unnamed: 0', 'name'], axis=1, inplace=True)
+    lat = df.loc[:, 'lat'][0]
+    lon = df.loc[:, 'lon'][0]
+    height = df.loc[:, 'height'][0]
+    df.drop(labels=['lat', 'lon', 'height'], axis=1, inplace=True)
+    ds = df.to_xarray()
+    station_attrs = {
+        'station_id': sid,
+        'lat': lat,
+        'lon': lon,
+        'height': height}
+    names_units_attrs = {
+        'ps': {
+            'long_name': 'surface_pressure', 'units': 'hPa'},
+        'tas': {
+            'long_name': 'surface_temperature', 'units': 'degC'},
+        'rh': {
+                'long_name': 'relative_humidity', 'units': '%'},
+        'wind_dir': {
+                    'long_name': 'wind_direction', 'units': 'deg'},
+        'wind_spd': {
+                        'long_name': 'wind_speed', 'units': 'm/s'}}
+    to_drop = []
+    for da in ds:
+        # add var names and units:
+        attr = names_units_attrs.get(da, {})
+        ds[da].attrs = attr
+        # add station attrs for each var:
+        ds[da].attrs.update(station_attrs)
+#        # rename var to include station name:
+#        ds[da].name = array_name + '_' + da
+        # last, drop all NaN vars:
+        try:
+            ds[da] = xr_reindex_with_date_range(ds[da], freq=freq)
+        except ValueError:
+            to_drop.append(da)
+            continue
+#        if ds[da].size == ds[da].isnull().sum().item():
+#            to_drop.append(da)
+    ds = ds[[x for x in ds if x not in to_drop]]
+    ds = rename_data_vars(ds, suffix=None, prefix=array_name + '_', verbose=False)
+    ds = ds.sortby('time')
+#    ds = xr_reindex_with_date_range(ds, freq=freq)
     return ds
+
+
+def interpolate_hourly_IMS(path=ims_path, freq='03', field='ps', max_gap='6H',
+                           station='JERUSALEM-CENTRE-MAN_6770', k_iqr=2,
+                           times=['1996', '2019'],
+                           plot=True):
+    from aux_gps import path_glob
+    from aux_gps import xr_reindex_with_date_range
+    from aux_gps import keep_iqr
+    import xarray as xr
+    import matplotlib.pyplot as plt
+    file = path_glob(path, 'IMS_hourly_{}hr.nc'.format(freq))[0]
+    ds = xr.open_dataset(file)
+    name = '{}_{}'.format(station, field)
+    da = ds[name]
+    da = xr_reindex_with_date_range(da, freq='1H')
+    da_inter = da.interpolate_na('time', max_gap=max_gap, method='cubic')
+    if times is not None:
+        da = da.sel(time=slice(*times))
+        da_inter = da_inter.sel(time=slice(*times))
+    if k_iqr is not None:
+        da_inter = keep_iqr(da_inter, k=k_iqr)
+    if plot:
+        fig, ax = plt.subplots(figsize=(18, 5))
+        df = da.to_dataframe()
+        df_inter = da_inter.to_dataframe()
+        df_inter.plot(style='b--', ax=ax)
+        df.plot(style='b-', marker='o', ax=ax, ms=5)
+        ax.legend(*[ax.get_lines()],
+                  ['PWV {} max interpolation'.format(max_gap), 'PWV'],
+                  loc='best')
+    return da_inter
 
 
 def read_ims_metadata_from_files(path=gis_path, freq='10mins'):
@@ -1606,6 +1733,7 @@ def fill_fix_all_10mins_IMS_stations(path=ims_10mins_path,
     use specific station names to slice irrelevant data"""
     import xarray as xr
     from aux_gps import path_glob
+    from aux_gps import get_unique_index
     # TODO: redo this analysis with adding the hourly TD data
     meta = read_ims_metadata_from_files(freq='10mins')
     files = path_glob(path, '*{}_10mins.nc'.format(field))
@@ -1691,8 +1819,18 @@ def fill_fix_all_10mins_IMS_stations(path=ims_10mins_path,
                                             clim_period=clim, savepath=path,
                                             verbose=False)
         elif field == 'TD' and fix_only:
+            if unique_index:
+                ind_diff = da.size - get_unique_index(da).size
+                da = get_unique_index(da)
+                if ind_diff > 0:
+                    print('dropped {} non-unique datetime index.'.format(ind_diff))
             da_list.append(da)
         else:
+            if unique_index:
+                ind_diff = da.size - get_unique_index(da).size
+                da = get_unique_index(da)
+                if ind_diff > 0:
+                    print('dropped {} non-unique datetime index.'.format(ind_diff))
             da_list.append(da)
         cnt += 1
     if field == 'TD' and not fix_only:
@@ -1704,6 +1842,7 @@ def fill_fix_all_10mins_IMS_stations(path=ims_10mins_path,
     else:
         dsl = da_list
     print('merging all files...')
+    dsl = [x.dropna('time') for x in dsl]
     ds = xr.merge(dsl)
     if savepath is not None:
         if field == 'TD' and not fix_only:

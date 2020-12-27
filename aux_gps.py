@@ -12,6 +12,486 @@ from PW_paths import work_yuval
 # TODO: if not, build func to replace datetimeindex to numbers and vise versa
 
 
+def replace_xarray_time_series_with_its_group(da, grp='month', time_dim='time'):
+    """run the same func on each dim in da"""
+    import xarray as xr
+    dims = [x for x in da.dims if time_dim not in x]
+    if len(dims) == 0:
+        # no other dim except time:
+        da = replace_time_series_with_its_group(da, grp=grp)
+        return da
+    dims_attrs = [da[x].attrs for x in dims]
+    dims_attrs_dict = dict(zip(dims, dims_attrs))
+    if len(dims) == 1:
+        dim0_list = []
+        for dim0 in da[dims[0]]:
+            da0 = da.sel({dims[0]: dim0})
+            da0 = replace_time_series_with_its_group(da0, grp=grp)
+            dim0_list.append(da0)
+        da_transformed = xr.concat(dim0_list, dims[0])
+        da_transformed[dims[0]] = da[dims[0]]
+        da_transformed.attrs[dims[0]] = dims_attrs_dict.get(dims[0])
+    elif len(dims) == 2:
+        dim0_list = []
+        for dim0 in da[dims[0]]:
+            dim1_list = []
+            for dim1 in da[dims[1]]:
+                da0 = da.sel({dims[0]: dim0, dims[1]: dim1})
+                da0 = replace_time_series_with_its_group(da0, grp=grp)
+                dim1_list.append(da0)
+            dim0_list.append(xr.concat(dim1_list, dims[1]))
+        da_transformed = xr.concat(dim0_list, dims[0])
+        da_transformed[dims[0]] = da[dims[0]]
+        da_transformed[dims[1]] = da[dims[1]]
+        da_transformed.attrs[dims[0]] = dims_attrs_dict.get(dims[0])
+        da_transformed.attrs[dims[1]] = dims_attrs_dict.get(dims[1])
+    elif len(dims) == 3:
+        dim0_list = []
+        for dim0 in da[dims[0]]:
+            dim1_list = []
+            for dim1 in da[dims[1]]:
+                dim2_list = []
+                for dim2 in da[dims[2]]:
+                    da0 = da.sel({dims[0]: dim0, dims[1]: dim1, dims[2]: dim2})
+                    da0 = replace_time_series_with_its_group(da0, grp=grp)
+                    dim2_list.append(da0)
+                dim1_list.append(xr.concat(dim2_list, dims[2]))
+            dim0_list.append(xr.concat(dim1_list, dims[1]))
+        da_transformed = xr.concat(dim0_list, dims[0])
+        da_transformed[dims[0]] = da[dims[0]]
+        da_transformed[dims[1]] = da[dims[1]]
+        da_transformed[dims[2]] = da[dims[2]]
+        da_transformed.attrs[dims[0]] = dims_attrs_dict.get(dims[0])
+        da_transformed.attrs[dims[1]] = dims_attrs_dict.get(dims[1])
+        da_transformed.attrs[dims[2]] = dims_attrs_dict.get(dims[2])
+    return da_transformed
+
+
+def replace_time_series_with_its_group(da_ts, grp='month'):
+    """ replace an xarray time series with its mean grouping e.g., time.month, 
+    time.dayofyear, time.hour etc.., basiaclly implement .transform method 
+    on 1D dataarray, index must be datetime"""
+    import xarray as xr
+    import pandas as pd
+    da_ts = da_ts.reset_coords(drop=True)
+    attrs = da_ts.attrs
+    df = da_ts.to_dataframe(da_ts.name)
+    if grp == 'month':
+        grp_ind = df.index.month
+    df = df.groupby(grp_ind).transform('mean')
+    ds = df.to_xarray()
+    da = ds[da_ts.name]
+    da.attrs = attrs
+    return da
+
+
+def calculate_gradient(f, lat_dim='latitude', lon_dim='longitude',
+                       level_dim='level', time_dim='time', savepath=None):
+    from metpy.calc import lat_lon_grid_deltas
+    from metpy.calc import gradient
+    from aux_gps import save_ncfile
+    import xarray as xr
+    name = f.name
+    dx, dy = lat_lon_grid_deltas(f[lon_dim], f[lat_dim])
+#    f = f.transpose(..., lat_dim, lon_dim)
+#    fy, fx = gradient(f, deltas=(dy, dx))
+    if level_dim in f.dims and time_dim in f.dims:
+        min_year = f[time_dim].dt.year.min().item()
+        max_year = f[time_dim].dt.year.max().item()
+        level_cnt = f[level_dim].size
+        label = '{}_{}-{}.nc'.format(level_cnt, min_year, max_year)
+        times = []
+        for time in f[time_dim]:
+            print('{}-{}'.format(time[time_dim].dt.month.item(), time[time_dim].dt.year.item()))
+            levels = []
+            for level in f[level_dim]:
+                ftl = f.sel({time_dim: time, level_dim: level})
+                fy, fx = gradient(ftl, deltas=(dy, dx))
+                fx_da = xr.DataArray(fx.magnitude, dims=[lat_dim, lon_dim])
+                fx_da.name = '{}x'.format(name)
+                fy_da = xr.DataArray(fy.magnitude, dims=[lat_dim, lon_dim])
+                fy_da.name = '{}y'.format(name)
+                fx_da.attrs['units'] = fx.units.format_babel()
+                fy_da.attrs['units'] = fy.units.format_babel()
+                grad = xr.merge([fx_da, fy_da])
+                levels.append(grad)
+            times.append(xr.concat(levels, level_dim))
+        ds = xr.concat(times, time_dim)
+        ds[level_dim] = f[level_dim]
+        ds[time_dim] = f[time_dim]
+        ds[lat_dim] = f[lat_dim]
+        ds[lon_dim] = f[lon_dim]
+    else:
+        if level_dim in f.dims:
+            level_cnt = f[level_dim].size
+            label = '{}.nc'.format(level_cnt)
+            levels = []
+            for level in f[level_dim]:
+                fl = f.sel({level_dim: level})
+                fy, fx = gradient(fl, deltas=(dy, dx))
+                fx_da = xr.DataArray(fx.magnitude, dims=[lat_dim, lon_dim])
+                fx_da.name = '{}x'.format(name)
+                fy_da = xr.DataArray(fy.magnitude, dims=[lat_dim, lon_dim])
+                fy_da.name = '{}y'.format(name)
+                fx_da.attrs['units'] = fx.units.format_babel()
+                fy_da.attrs['units'] = fy.units.format_babel()
+                grad = xr.merge([fx_da, fy_da])
+                levels.append(grad)
+            da = xr.concat(levels, level_dim)
+            da[level_dim] = f[level_dim]
+        elif time_dim in f.dims:
+            min_year = f[time_dim].dt.year.min().item()
+            max_year = f[time_dim].dt.year.max().item()
+            min_year = f[time_dim].dt.year.min().item()
+            max_year = f[time_dim].dt.year.max().item()
+            times = []
+            for time in f[time_dim]:
+                ft = f.sel({time_dim: time})
+                fy, fx = gradient(ft, deltas=(dy, dx))
+                fx_da = xr.DataArray(fx.magnitude, dims=[lat_dim, lon_dim])
+                fx_da.name = '{}x'.format(name)
+                fy_da = xr.DataArray(fy.magnitude, dims=[lat_dim, lon_dim])
+                fy_da.name = '{}y'.format(name)
+                fx_da.attrs['units'] = fx.units.format_babel()
+                fy_da.attrs['units'] = fy.units.format_babel()
+                grad = xr.merge([fx_da, fy_da])
+                times.append(grad)
+            ds = xr.concat(times, time_dim)
+            ds[time_dim] = f[time_dim]
+        ds[lat_dim] = f[lat_dim]
+        ds[lon_dim] = f[lon_dim]
+    if savepath is not None:
+        filename = '{}_grad_{}'.format(f.name, label)
+        save_ncfile(ds, savepath, filename)
+    return ds
+
+
+def calculate_divergence(u, v, lat_dim='latitude', lon_dim='longitude',
+                         level_dim='level', time_dim='time', savepath=None):
+    from metpy.calc import divergence
+    from metpy.calc import lat_lon_grid_deltas
+    from aux_gps import save_ncfile
+    import xarray as xr
+    dx, dy = lat_lon_grid_deltas(u[lon_dim], u[lat_dim])
+    u = u.transpose(..., lat_dim, lon_dim)
+    v = v.transpose(..., lat_dim, lon_dim)
+    if level_dim in u.dims and time_dim in u.dims:
+        min_year = u[time_dim].dt.year.min().item()
+        max_year = u[time_dim].dt.year.max().item()
+        level_cnt = u[level_dim].size
+        label = '{}_{}-{}.nc'.format(level_cnt, min_year, max_year)
+        times = []
+        for time in u[time_dim]:
+            print('{}-{}'.format(time[time_dim].dt.month.item(), time[time_dim].dt.year.item()))
+            levels = []
+            for level in u[level_dim]:
+                utl = u.sel({time_dim: time, level_dim: level})
+                vtl = v.sel({time_dim: time, level_dim: level})
+                div = divergence(utl, vtl, dx=dx, dy=dy)
+                div_da = xr.DataArray(div.magnitude, dims=[lat_dim, lon_dim])
+                div_da.attrs['units'] = div.units.format_babel()
+                levels.append(div_da)
+            times.append(xr.concat(levels, level_dim))
+        da = xr.concat(times, time_dim)
+        da[level_dim] = u[level_dim]
+        da[time_dim] = u[time_dim]
+        da[lat_dim] = u[lat_dim]
+        da[lon_dim] = u[lon_dim]
+        da.name = '{}{}_div'.format(u.name, v.name)
+    else:
+        if level_dim in u.dims:
+            level_cnt = u[level_dim].size
+            label = '{}.nc'.format(level_cnt)
+            levels = []
+            for level in u[level_dim]:
+                ul = u.sel({level_dim: level})
+                vl = v.sel({level_dim: level})
+                div = divergence(ul, vl, dx=dx, dy=dy)
+                div_da = xr.DataArray(div.magnitude, dims=[lat_dim, lon_dim])
+                div_da.attrs['units'] = div.units.format_babel()
+                levels.append(div_da)
+            da = xr.concat(levels, level_dim)
+            da[level_dim] = u[level_dim]
+        elif time_dim in u.dims:
+            min_year = u[time_dim].dt.year.min().item()
+            max_year = u[time_dim].dt.year.max().item()
+            min_year = u[time_dim].dt.year.min().item()
+            max_year = u[time_dim].dt.year.max().item()
+            times = []
+            for time in u[time_dim]:
+                ut = u.sel({time_dim: time})
+                vt = v.sel({time_dim: time})
+                div = divergence(ut, vt, dx=dx, dy=dy)
+                div_da = xr.DataArray(div.magnitude, dims=[lat_dim, lon_dim])
+                div_da.attrs['units'] = div.units.format_babel()
+                times.append(div_da)
+            da = xr.concat(times, time_dim)
+            da[time_dim] = u[time_dim]
+        da[lat_dim] = u[lat_dim]
+        da[lon_dim] = u[lon_dim]
+        da.name = '{}{}_div'.format(u.name, v.name)
+    if savepath is not None:
+        filename = '{}{}_div_{}'.format(u.name, v.name, label)
+        save_ncfile(da, savepath, filename)
+    return da
+
+
+def calculate_pressure_integral(da, pdim='level'):
+    import numpy as np
+    # first sort to decending levels:
+    da = da.sortby(pdim, ascending=False)
+    try:
+        units = da[pdim].attrs['units']
+    except KeyError:
+        print('no units attrs found, assuming units are hPa')
+        units = 'hPa'
+    # transform to Pa:
+    if units != 'Pa':
+        print('{} units detected, converting to Pa!'.format(units))
+        da[pdim] = da[pdim] * 100
+    # P_{i+1} - P_i:
+    plevel_diff = np.abs(da[pdim].diff(pdim, label='lower'))
+    # var_i + var_{i+1}:
+    da_sum = da.shift(level=-1) + da
+    p_int = ((da_sum * plevel_diff) / 2.0).sum(pdim)
+    return p_int
+
+
+def linear_fit_using_scipy_da_ts(da_ts, model='TSEN', slope_factor=3650.25,
+                                 plot=False, ax=None, units=None,
+                                 method='simple', weights=None, not_time=False):
+    """linear fit using scipy for dataarray time series,
+    support for theilslopes(TSEN) and lingress(LR), produce 95% CI"""
+    import xarray as xr
+    from scipy.stats.mstats import theilslopes
+    from scipy.stats import linregress
+    import matplotlib.pyplot as plt
+    from scipy.optimize import curve_fit
+    import numpy as np
+    time_dim = list(set(da_ts.dims))[0]
+    y = da_ts.dropna(time_dim).values
+    if not_time:
+        X = da_ts[time_dim].values.reshape(-1, 1)
+        jul_no_nans = da_ts.dropna(time_dim)[time_dim].values
+        jul = da_ts[time_dim].values
+    else:
+        jul, jul_no_nans = get_julian_dates_from_da(da_ts, subtract='median')
+        X = jul_no_nans.reshape(-1, 1)
+    if model == 'LR':
+        if method == 'simple':
+            coef, intercept, r_value, p_value, std_err = linregress(jul_no_nans, y)
+            confidence_interval = 1.96 * std_err
+            coef_lo = coef - confidence_interval
+            coef_hi = coef + confidence_interval
+        elif method == 'curve_fit':
+            func = lambda x, a, b: a * x + b
+            if weights is not None:
+                sigma = weights.dropna(time_dim).values
+            else:
+                sigma = None
+            best_fit_ab, covar = curve_fit(func, jul_no_nans, y,
+                                           sigma = sigma,p0=[0, 0],
+                                           absolute_sigma = False)
+            sigma_ab = np.sqrt(np.diagonal(covar))
+            coef = best_fit_ab[0]
+            intercept = best_fit_ab[1]
+            coef_lo = coef - sigma_ab[0]
+            coef_hi = coef + sigma_ab[0]
+    elif model == 'TSEN':
+        coef, intercept, coef_lo, coef_hi = theilslopes(y, X)
+    predict = jul * coef + intercept
+    predict_lo = jul * coef_lo + intercept
+    predict_hi = jul * coef_hi + intercept
+    trend_hi = xr.DataArray(predict_hi, dims=[time_dim])
+    trend_hi.name = 'trend_hi'
+    trend_lo = xr.DataArray(predict_lo, dims=[time_dim])
+    trend_lo.name = 'trend_lo'
+    trend_hi[time_dim] = da_ts[time_dim]
+    trend_lo[time_dim] = da_ts[time_dim]
+    slope_in_factor_scale_lo = coef_lo * slope_factor
+    slope_in_factor_scale_hi = coef_hi * slope_factor
+    trend = xr.DataArray(predict, dims=[time_dim])
+    trend.name = 'trend'
+    trend[time_dim] = da_ts[time_dim]
+    slope_in_factor_scale = coef * slope_factor
+    if plot:
+        labels =  ['{}'.format(da_ts.name)]
+        if ax is None:
+            fig, ax = plt.subplots()
+        origln = da_ts.plot.line('k-', marker='o', ax=ax, linewidth=1.5, markersize=2.5)
+        trendln = trend.plot(ax=ax, color='r', linewidth=2)
+        trend_hi.plot.line('r--', ax=ax, linewidth=1.5)
+        trend_lo.plot.line('r--', ax=ax, linewidth=1.5)
+        trend_label = '{} model, slope={:.2f} ({:.2f}, {:.2f}) {}'.format(model, slope_in_factor_scale, slope_in_factor_scale_lo, slope_in_factor_scale_hi, units)
+        handles = origln
+        handles += trendln
+        labels.append(trend_label)
+        ax.legend(handles=handles, labels=labels, loc='upper left')
+        ax.grid()
+    trend_ds = xr.merge([trend, trend_hi, trend_lo])
+    results_dict = {'slope_hi': slope_in_factor_scale_hi, 'slope_lo': slope_in_factor_scale_lo, 'slope': slope_in_factor_scale}
+    results_dict['intercept'] = intercept
+    return trend_ds, results_dict
+
+
+def split_equal_da_ts_around_datetime(da_ts, dt='2014-05-01'):
+    time_dim = list(set(da_ts.dims))[0]
+    x1 = da_ts.dropna(time_dim).sel({time_dim: slice(None, dt)})
+    x2 = da_ts.dropna(time_dim).sel({time_dim: slice(dt, None)})
+    if x1.size == 0 or x2.size == 0:
+        raise ValueError('one or two of the sub-series is 0 size.')
+    if x1.size > x2.size:
+        x1 = x1.isel({time_dim: slice(-x2.size , None)})
+    elif x1.size < x2.size:
+        x2 = x2.isel({time_dim: slice(0, x1.size)})
+    return x1, x2
+
+
+def wilcoxon_rank_test_xr(
+        da_ts, alpha=0.05,
+        cp_dt='2014-05-01',
+        zero_method='wilcox',
+        correction=False,
+        alternative='two-sided',
+        mode='auto'):
+    import xarray as xr
+    from scipy.stats import wilcoxon
+    x, y = split_equal_da_ts_around_datetime(da_ts, dt=cp_dt)
+    stat, pvalue = wilcoxon(x, y, zero_method=zero_method,
+                            correction=correction, alternative=alternative
+                            )
+    if pvalue < alpha:
+        # the two parts of the time series come from different distributions
+        print('Two distributions!')
+        normal = False
+    else:
+        # same distribution
+        print('Same distribution')
+        normal = True
+    da = xr.DataArray([stat, pvalue, normal], dims=['result'])
+    da['result'] = ['stat', 'pvalue', 'h']
+    return da
+
+
+def normality_test_xr(da_ts, sample=None, alpha=0.05, test='lili',
+                      dropna=True, verbose=True):
+    """normality tests on da_ts"""
+    from statsmodels.stats.diagnostic import lilliefors
+    from scipy.stats import shapiro
+    from scipy.stats import normaltest
+    import xarray as xr
+    time_dim = list(set(da_ts.dims))[0]
+    if sample is not None:
+        da_ts = da_ts.resample({time_dim: sample}).mean()
+    if dropna:
+        da_ts = da_ts.dropna(time_dim)
+    if test == 'shapiro':
+        stat, pvalue = shapiro(da_ts)
+    elif test == 'lili':
+        stat, pvalue = lilliefors(da_ts, dist='norm', pvalmethod='table')
+    elif test == 'normaltest':
+        stat, pvalue = normaltest(da_ts)
+    if pvalue < alpha:
+        Not = 'NOT'
+        normal = False
+    else:
+        Not = ''
+        normal = True
+    if verbose:
+        print('Mean: {:.4f}, pvalue: {:.4f}'.format(stat, pvalue))
+        print('Thus, the data is {} Normally distributed with alpha {}'.format(Not, alpha))
+    da = xr.DataArray([stat, pvalue, normal], dims=['result'])
+    da['result'] = ['stat', 'pvalue', 'h']
+    return da
+
+
+def homogeneity_test_xr(da_ts, hg_test_func, dropna=True, alpha=0.05,
+                        sim=None, verbose=True):
+    """False means data is homogenous, True means non-homogenous with significance alpha"""
+    import xarray as xr
+    import pandas as pd
+    time_dim = list(set(da_ts.dims))[0] 
+    if dropna:
+        da_ts = da_ts.dropna(time_dim)
+    h, cp, p, U, mu = hg_test_func(da_ts, alpha=alpha, sim=sim)
+    result = hg_test_func(da_ts, alpha=alpha, sim=sim)
+    name = type(result).__name__
+    if verbose:
+        print('running homogeneity {} with alpha {} and sim {}'.format(name, alpha, sim))
+
+    cpl = pd.to_datetime(da_ts.isel({time_dim: result.cp})[time_dim].values)
+    if 'U' in result._fields:
+        stat = result.U
+    elif 'T' in result._fields:
+        stat = result.T
+    elif 'Q' in result._fields:
+        stat = result.Q
+    elif 'R' in result._fields:
+        stat = result.R
+    elif 'V' in result._fields:
+        stat = result.V
+    da = xr.DataArray([name, result.h, cpl, result.p, stat, result.avg], dims=['results'])
+    da['results'] = ['name', 'h', 'cp_dt', 'pvalue', 'stat', 'means']
+    return da
+
+
+def VN_ratio_trend_test_xr(da_ts, dropna=True, alpha=0.05, loadpath=work_yuval,
+                        verbose=True, return_just_trend=False):
+    """calculate the Von Nuemann ratio test statistic and test for trend."""
+    import xarray as xr
+    time_dim = list(set(da_ts.dims))[0]
+    if dropna:
+        da_ts = da_ts.dropna(time_dim)
+    n = da_ts.dropna(time_dim).size
+    d2 = (da_ts.diff(time_dim)**2.0).sum() / (n - 1)
+    # s**2 is the variance:
+    s2 = da_ts.var()
+    eta = (d2 / s2).item()
+    cv_da = xr.load_dataarray(loadpath / 'VN_critical_values.nc')
+    cv = cv_da.sel(sample_size=n, pvalue=alpha, method='nearest').item()
+    if eta < cv:
+        if verbose:
+            print('the hypothesis of stationary cannot be rejected at the level {}'.format(alpha))
+        trend = True
+    else:
+        trend = False
+    if return_just_trend:
+        return trend
+    else:
+        da = xr.DataArray([eta, cv, trend, n], dims=['results'])
+        da['results'] = ['eta', 'cv', 'trend', 'n']
+        return da
+
+
+def reduce_tail_xr(xarray, reduce='mean', time_dim='time', records=120,
+                   return_df=False):
+    import xarray as xr
+
+    def reduce_tail_da(da, reduce=reduce, time_dim=time_dim, records=records):
+        if reduce == 'mean':
+            da = da.dropna(time_dim).tail(records).mean(time_dim)
+        return da
+    if isinstance(xarray, xr.DataArray):
+        xarray = reduce_tail_da(xarray, reduce, time_dim, records)
+    elif isinstance(xarray, xr.Dataset):
+        xarray = xarray.map(reduce_tail_da, args=(reduce, time_dim, records))
+        if return_df:
+            df = xarray.to_array('dum').to_dataframe(reduce)
+            df.index.name = ''
+            return df
+    return xarray
+
+
+def decimal_year_to_datetime(decimalyear):
+    from datetime import datetime, timedelta
+    import pandas as pd
+    year = int(decimalyear)
+    rem = decimalyear - year
+    base = datetime(year, 1, 1)
+    result = base + timedelta(seconds=(base.replace(year=base.year + 1) - base).total_seconds() * rem)
+    return pd.to_datetime(result)
+
+
 def select_months(da_ts, months, remove=False, reindex=True):
     import xarray as xr
     from aux_gps import xr_reindex_with_date_range
@@ -19,10 +499,14 @@ def select_months(da_ts, months, remove=False, reindex=True):
     import numpy as np
     time_dim = list(set(da_ts.dims))[0]
     attrs = da_ts.attrs
+    try:
+        name = da_ts.name
+    except AttributeError:
+        name = ''
     if remove:
         all_months = np.arange(1, 13)
         months = list(set(all_months).difference(set(months)))
-    print('selecting months #{} from {}'.format(', #'.join([str(x) for x in months]), da_ts.name))
+    print('selecting months #{} from {}'.format(', #'.join([str(x) for x in months]), name))
     to_add = []
     for month in months:
         sliced = da_ts.sel({time_dim: da_ts['{}.month'.format(time_dim)] == int(month)})
@@ -45,6 +529,8 @@ def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
         n_max = harmonic_dss.cpd.max().values.item()
     try:
         field = harmonic_dss.attrs['field']
+        if field == 'PW':
+            field = 'PWV'
     except KeyError:
         field = 'no name'
     name = [x for x in harmonic_dss][0].split('_')[0]
@@ -76,8 +562,9 @@ def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 6))
         markers = ['s', 'x', '^', '>', '<', 'X']
-        colors = ['tab:blue', 'tab:red', 'tab:orange', 'tab:green', 'tab:purple']
-        styles = ['-', '--', '-.', ':']
+        colors = ['tab:blue', 'tab:red', 'tab:orange', 'tab:green',
+                  'tab:purple', 'tab:yellow']
+        styles = ['-', '--', '-.', ':', 'None', ' ']
         for i, cpd in enumerate(harmonic['cpd'].values):
             harmonic[name + '_mean'].sel(cpd=cpd).plot(ax=ax, linestyle=styles[i], color=colors[i]) # marker=markers[i])
         harmonic[name + '_mean'].sum('cpd').plot(ax=ax, marker=None, color='k', alpha=0.7)
@@ -87,12 +574,11 @@ def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
         S = ['S{} ({:.0f}%)'.format(x, exp_dict[int(x)]) for x in harmonic['cpd'].values]
         ax.legend(
             S + S_total + [field],
-            prop={
-                'size': legsize},
+            prop={'size': legsize},
             framealpha=0.5,
             fancybox=True,
-            loc=legend_loc, ncol=ncol)
-        ax.grid()
+            loc=legend_loc, ncol=ncol, columnspacing=0.75, handlelength=1.0)
+#        ax.grid()
         ax.set_xlabel('Time of day [UTC]')
         # ax.set_ylabel('{} anomalies [mm]'.format(field))
         if season is None:
@@ -114,6 +600,8 @@ def harmonic_analysis_xr(da, n=6, normalize=False, anomalize=False, freq='D',
         field = da.attrs['channel_name']
     except KeyError:
         field = user_field_name
+    if field is None:
+        field = ''
     if normalize:
         da = normalize_xr(da, norm=1)
     time_dim = list(set(da.dims))[0]
@@ -166,9 +654,9 @@ def harmonic_da(da_ts, n=3, field=None, init=None):
             verbose=False)
         name = da_ts.name.split('_')[0]
         params_da = xr.DataArray([x for x in res.attrs.values()],
-                                  dims=['params', 'val/err'])
+                                  dims=['params', 'val_err'])
         params_da['params'] = [x for x in res.attrs.keys()]
-        params_da['val/err'] = ['value', 'stderr']
+        params_da['val_err'] = ['value', 'stderr']
         params_da.name = name + '_params'
         name = res.name.split('_')[0]
         diurnal_mean = res.groupby('{}.hour'.format(time_dim)).mean()
@@ -193,37 +681,79 @@ def harmonic_da(da_ts, n=3, field=None, init=None):
     return ds
 
 
-def anomalize_xr(da_ts, freq='D'):  # i.e., like deseason
-    time_dim = list(set(da_ts.dims))[0]
+def anomalize_xr(da_ts, freq='D', time_dim=None, verbose=True):  # i.e., like deseason
+    import xarray as xr
+    if time_dim is None:
+        time_dim = list(set(da_ts.dims))[0]
     attrs = da_ts.attrs
+    if isinstance(da_ts, xr.Dataset):
+        da_attrs = dict(zip([x for x in da_ts],[da_ts[x].attrs for x in da_ts]))
     try:
         name = da_ts.name
     except AttributeError:
         name = ''
+    if isinstance(da_ts, xr.Dataset):
+        name = [x for x in da_ts]
     if freq == 'D':
-        print('removing daily means from {}'.format(name))
+        if verbose:
+            print('removing daily means from {}'.format(name))
+        frq = 'daily'
         date = groupby_date_xr(da_ts)
         da_anoms = da_ts.groupby(date) - da_ts.groupby(date).mean()
+    elif freq == 'H':
+        if verbose:
+            print('removing hourly means from {}'.format(name))
+        frq = 'hourly'
+        da_anoms = da_ts.groupby('{}.hour'.format(
+            time_dim)) - da_ts.groupby('{}.hour'.format(time_dim)).mean()
     elif freq == 'MS':
-        print('removing monthly means from {}'.format(name))
+        if verbose:
+            print('removing monthly means from {}'.format(name))
+        frq = 'monthly'
         da_anoms = da_ts.groupby('{}.month'.format(
             time_dim)) - da_ts.groupby('{}.month'.format(time_dim)).mean()
     da_anoms = da_anoms.reset_coords(drop=True)
     da_anoms.attrs.update(attrs)
+    da_anoms.attrs.update(action='removed {} means'.format(frq))
+    # if dataset, update attrs for each dataarray and add action='removed x means'
+    if isinstance(da_ts, xr.Dataset):
+        for x in da_ts:
+            da_anoms[x].attrs.update(da_attrs.get(x))
+            da_anoms[x].attrs.update(action='removed {} means'.format(frq))
     return da_anoms
 
 
-def grab_n_consecutive_epochs_from_ts(da_ts, sep='nan', n=10):
+def line_and_num_for_phrase_in_file(phrase='the dog barked', filename='file.txt'):
+    with open(filename, 'r') as f:
+        for (i, line) in enumerate(f):
+            if phrase in line:
+                return i, line
+    return None, None
+
+
+def grab_n_consecutive_epochs_from_ts(da_ts, sep='nan', n=10, time_dim=None,
+                                      return_largest=False):
     """grabs n consecutive epochs from time series (xarray dataarrays)
     and return list of either dataarrays"""
+    if time_dim is None:
+        time_dim = list(set(da_ts.dims))[0]
     df = da_ts.to_dataframe()
     A = consecutive_runs(df, num='nan')
     A = A.sort_values('total_not-nan', ascending=False)
+    max_n = len(A)
+    if return_largest:
+        start = A.iloc[0, 0]
+        end = A.iloc[0, 1]
+        da = da_ts.isel({time_dim:slice(start, end)})
+        return da
+    if n > max_n:
+        print('{} epoches requested but only {} available'.format(n, max_n))
+        n = max_n
     da_list = []
     for i in range(n):
         start = A.iloc[i, 0]
         end = A.iloc[i, 1]
-        da = da_ts.isel(time=slice(start, end))
+        da = da_ts.isel({time_dim: slice(start, end)})
         da_list.append(da)
     return da_list
 
@@ -298,6 +828,28 @@ def grab_n_consecutive_epochs_from_ts(da_ts, sep='nan', n=10):
 #        return hour
 
 
+def groupby_half_hour_xr(da_ts, reduce='mean'):
+    import pandas as pd
+    import numpy as np
+    df = da_ts.to_dataframe()
+    native_freq = pd.infer_freq(df.index)
+    if not native_freq:
+        raise('Cannot infer frequency...')
+    if reduce == 'mean':
+        df = df.groupby([df.index.hour, df.index.minute]).mean()
+    elif reduce == 'std':
+        df = df.groupby([df.index.hour, df.index.minute]).std()
+    time = pd.date_range(start='1900-01-01', periods=df.index.size,
+                         freq=native_freq)
+    df = df.set_index(time)
+    df = df.resample('30T').mean()
+    half_hours = np.arange(0, 24, 0.5)
+    df.index = half_hours
+    df.index.name = 'half_hour'
+    ds = df.to_xarray()
+    return ds
+
+
 def groupby_date_xr(da_ts):
     df = da_ts.to_dataframe()
     df['date'] = df.index.date
@@ -354,12 +906,17 @@ def error_mean_rmse(y, y_pred):
     return mean, rmse
 
 
-def rename_data_vars(ds, suffix='_error', remove_suffix=False, verbose=False):
+def rename_data_vars(ds, suffix='_error', prefix=None, verbose=False):
     import xarray as xr
     if not isinstance(ds, xr.Dataset):
         raise ValueError('input must be an xarray dataset object!')
     vnames = [x for x in ds.data_vars]
-    new_names = [x + suffix for x in ds.data_vars]
+#    if remove_suffix:
+#        new_names = [x.replace(suffix, '') for x in ds.data_vars]
+    if suffix is not None:
+        new_names = [str(x) + suffix for x in ds.data_vars]
+    if prefix is not None:
+        new_names = [prefix + str(x) for x in ds.data_vars]
     name_dict = dict(zip(vnames, new_names))
     ds = ds.rename_vars(name_dict)
     if verbose:
@@ -373,15 +930,19 @@ def remove_duplicate_spaces_in_string(line):
     return line_removed
 
 
-def save_ncfile(xarray, savepath, filename='temp.nc'):
+def save_ncfile(xarray, savepath, filename='temp.nc', engine=None, dtype=None,
+                fillvalue=None):
     import xarray as xr
     print('saving {} to {}'.format(filename, savepath))
-    comp = dict(zlib=True, complevel=9)  # best compression
+    if dtype is None:
+        comp = dict(zlib=True, complevel=9, _FillValue=fillvalue)  # best compression
+    else:
+        comp = dict(zlib=True, complevel=9, dtype=dtype, _FillValue=fillvalue)  # best compression
     if isinstance(xarray, xr.Dataset):
         encoding = {var: comp for var in xarray}
     elif isinstance(xarray, xr.DataArray):
         encoding = {var: comp for var in xarray.to_dataset()}
-    xarray.to_netcdf(savepath / filename, 'w', encoding=encoding)
+    xarray.to_netcdf(savepath / filename, 'w', encoding=encoding, engine=engine)
     print('File saved!')
     return
 
@@ -502,6 +1063,35 @@ def calculate_g(lat):
     return g
 
 
+def find_consecutive_vals_df(df, col='class', val=7):
+    import numpy as np
+    bool_vals = np.where(df[col] == val, 1, 0)
+    con_df = consecutive_runs(bool_vals, num=0)
+    return con_df
+
+
+def lat_mean(xarray, method='cos', dim='lat', copy_attrs=True):
+    import numpy as np
+    import xarray as xr
+
+    def mean_single_da(da, dim=dim, method=method):
+        if dim not in da.dims:
+            return da
+        if method == 'cos':
+            weights = np.cos(np.deg2rad(da[dim].values))
+            da_mean = (weights * da).sum(dim) / sum(weights)
+        if copy_attrs:
+            da_mean.attrs = da.attrs
+        return da_mean
+
+    xarray = xarray.transpose(..., 'lat')
+    if isinstance(xarray, xr.DataArray):
+        xarray = mean_single_da(xarray)
+    elif isinstance(xarray, xr.Dataset):
+        xarray = xarray.map(mean_single_da, keep_attrs=copy_attrs)
+    return xarray
+
+
 def consecutive_runs(arr, num=False):
     import numpy as np
     import pandas as pd
@@ -528,10 +1118,8 @@ def consecutive_runs(arr, num=False):
     if isinstance(arr, pd.DataFrame):
         if isinstance(num, bool):
             notnum = not num
-        elif num == 1:
-            notnum = 0
-        elif num == 0:
-            notnum = 1
+        elif isinstance(num, int):
+            notnum = 'not-{}'.format(num)
         elif num == 'nan':
             notnum = 'not-nan'
         A.columns = [
@@ -541,8 +1129,19 @@ def consecutive_runs(arr, num=False):
     return A
 
 
-def gantt_chart(ds, fw='bold', ax=None, pe_dict=None,
-                title='RINEX files availability for the Israeli GNSS stations'):
+def get_all_possible_combinations_from_list(li, reduce_single_list=True):
+    from itertools import combinations
+    output = sum([list(map(list, combinations(li, i)))
+                  for i in range(len(li) + 1)], [])
+    output = output[1:]
+    if reduce_single_list:
+        output = [x[0] if len(x) == 1 else x for x in output]
+    return output
+
+
+def gantt_chart(ds, fw='bold', ax=None, pe_dict=None, fontsize=14, linewidth=10,
+                title='RINEX files availability for the Israeli GNSS stations',
+                time_dim='time', antialiased=False):
     import pandas as pd
     import matplotlib.pyplot as plt
     import numpy as np
@@ -556,8 +1155,8 @@ def gantt_chart(ds, fw='bold', ax=None, pe_dict=None,
         fig, ax = plt.subplots(figsize=(20, 6))
     names = [x for x in ds]
     vals = range(1, len(ds) + 1)
-    xmin = pd.to_datetime(ds.time.min().values) - pd.Timedelta(1, unit='W')
-    xmax = pd.to_datetime(ds.time.max().values) + pd.Timedelta(1, unit='W')
+    xmin = pd.to_datetime(ds[time_dim].min().values) - pd.Timedelta(1, unit='W')
+    xmax = pd.to_datetime(ds[time_dim].max().values) + pd.Timedelta(1, unit='W')
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 #    dt_min_list = []
 #    dt_max_list = []
@@ -579,15 +1178,15 @@ def gantt_chart(ds, fw='bold', ax=None, pe_dict=None,
 #        dt_max_list.append(dt_max)
         # v = int(calc(i, max = len(ds)))
         if pe_dict is not None:
-            ax.hlines(y, dt_min, dt_max, linewidth=10, color=colors[i], path_effects=[pe.Stroke(linewidth=15, foreground='k'), pe.Normal()])
+            ax.hlines(y, dt_min, dt_max, linewidth=linewidth, color=colors[i], path_effects=[pe.Stroke(linewidth=15, foreground='k'), pe.Normal()])
         else:
-            ax.hlines(y, dt_min, dt_max, linewidth=10, color=colors[i])
+            ax.hlines(y, dt_min, dt_max, linewidth=linewidth, color=colors[i], antialiased=antialiased)
         #plt.show()
         # ds[da][~ds[da].isnull()] = i + 1
         # ds[da] = ds[da].fillna(0)
     # yticks and their labels:
     ax.set_yticks(vals)
-    ax.set_yticklabels(names[::-1], fontweight=fw, fontsize=12)
+    ax.set_yticklabels(names[::-1], fontweight=fw, fontsize=fontsize)
     [ax.get_yticklabels()[i].set_color(colors[::-1][i]) for i in range(len(colors))]
     ax.set_xlim(xmin, xmax)
     # handle x-axis (time):
@@ -597,7 +1196,7 @@ def gantt_chart(ds, fw='bold', ax=None, pe_dict=None,
         labeltop=False,
         labelbottom=True,
         top=False,
-        bottom=True, left=True)
+        bottom=True, left=True, labelsize=fontsize)
     ax.minorticks_on()
     ax.tick_params(which='minor',
         direction='out',
@@ -608,9 +1207,9 @@ def gantt_chart(ds, fw='bold', ax=None, pe_dict=None,
 #     ax.xaxis.set_minor_locator(mdates.YearLocator())
 #    ax.xaxis.set_minor_formatter(mdates.DateFormatter("\n%Y"))
     plt.setp(ax.xaxis.get_majorticklabels(), rotation=30, ha='center',
-             fontweight=fw)
+             fontweight=fw, fontsize=fontsize)
     plt.setp(ax.xaxis.get_minorticklabels(), rotation=30, ha='center',
-             fontweight=fw)
+             fontweight=fw, fontsize=fontsize)
     # grid lines:
 #    ax.grid(which='major', axis='x', linestyle='-', color='k')
 #    ax.grid(which='minor', axis='x', linestyle='-', color='k')
@@ -655,6 +1254,37 @@ def time_series_stack_with_window(ts_da, time_dim='time',
     return ds
 
 
+def get_RI_reg_combinations(dataset):
+    """return n+1 sized dataset of full regressors and median value regressors"""
+    import xarray as xr
+
+    def replace_dta_with_median(dataset, dta):
+        ds = dataset.copy()
+        ds[dta] = dataset[dta] - dataset[dta] + dataset[dta].median('time')
+        ds.attrs['median'] = dta
+        return ds
+    if type(dataset) != xr.Dataset:
+        return print('Input is xarray dataset only')
+    ds_list = []
+    ds_list.append(dataset)
+    dataset.attrs['median'] = 'full_set'
+    for da in dataset.data_vars:
+        ds_list.append(replace_dta_with_median(dataset, da))
+    return ds_list
+
+
+def annual_standertize(data, time_dim='time', std_nan=1.0):
+    """just divide by the time.month std()"""
+    attrs = data.attrs
+    std_longterm = data.groupby('{}.month'.format(time_dim)).std(keep_attrs=True)
+    if std_nan is not None:
+        std_longterm = std_longterm.fillna(std_nan)
+    data = data.groupby('{}.month'.format(time_dim)) / std_longterm
+    data = data.reset_coords(drop=True)
+    data.attrs.update(attrs)
+    return data
+
+    
 def normalize_xr(data, time_dim='time', norm=1, down_bound=-1.,
                  upper_bound=1., verbose=True):
     attrs = data.attrs
@@ -855,20 +1485,28 @@ def fit_da_to_model(da, params=None, modelname='sin', method='leastsq', times=No
     return fit
 
 
-def get_julian_dates_from_da(da):
+def get_julian_dates_from_da(da, subtract='first'):
     """transform the time dim of a dataarray to julian dates(days since)"""
     import pandas as pd
+    import numpy as np
     # get time dim:
     time_dim = list(set(da.dims))[0]
     # convert to days since 2000 (julian_date):
     jul = pd.to_datetime(da[time_dim].values).to_julian_date()
     # normalize all days to first entry:
-    first_day = jul[0]
-    jul -= first_day
+    if subtract == 'first':
+        first_day = jul[0]
+        jul -= first_day
+    elif subtract == 'median':
+        med = np.median(jul)
+        jul -= med
     # do the same but without nans:
     jul_no_nans = pd.to_datetime(
             da.dropna(time_dim)[time_dim].values).to_julian_date()
-    jul_no_nans -= first_day
+    if subtract == 'first':
+        jul_no_nans -= first_day
+    elif subtract == 'median':
+        jul_no_nans -= med
     return jul.values, jul_no_nans.values
 
 
@@ -1266,6 +1904,14 @@ def flip_xy_axes(ax, ylim=None):
     return ax
 
 
+def choose_time_groupby_arg(da_ts, time_dim='time', grp='hour'):
+    if grp != 'date':
+        grp_arg = '{}.{}'.format(time_dim, grp)
+    else:
+        grp_arg = groupby_date_xr(da_ts)
+    return grp_arg
+
+
 def time_series_stack(time_da, time_dim='time', grp1='hour', grp2='month',
                       plot=True):
     """Takes a time-series xr.DataArray objects and reshapes it using
@@ -1281,37 +1927,54 @@ def time_series_stack(time_da, time_dim='time', grp1='hour', grp2='month',
     # drop all NaNs:
     time_da = time_da.dropna(time_dim)
     # first grouping:
-    grp_obj1 = time_da.groupby(time_dim + '.' + grp1)
+    grp1_arg = choose_time_groupby_arg(time_da, time_dim=time_dim, grp=grp1)
+    grp_obj1 = time_da.groupby(grp1_arg)
     da_list = []
     t_list = []
     for grp1_name, grp1_inds in grp_obj1.groups.items():
         da = time_da.isel({time_dim: grp1_inds})
-        # second grouping:
-        grp_obj2 = da.groupby(time_dim + '.' + grp2)
-        for grp2_name, grp2_inds in grp_obj2.groups.items():
-            da2 = da.isel({time_dim: grp2_inds})
-            # extract datetimes and rewrite time coord to 'rest':
-            times = da2[time_dim]
+        if grp2 is not None:
+            # second grouping:
+            grp2_arg = choose_time_groupby_arg(time_da, time_dim=time_dim, grp=grp2)
+            grp_obj2 = da.groupby(grp2_arg)
+            for grp2_name, grp2_inds in grp_obj2.groups.items():
+                da2 = da.isel({time_dim: grp2_inds})
+                # extract datetimes and rewrite time coord to 'rest':
+                times = da2[time_dim]
+                times = times.rename({time_dim: 'rest'})
+                times.coords['rest'] = range(len(times))
+                t_list.append(times)
+                da2 = da2.rename({time_dim: 'rest'})
+                da2.coords['rest'] = range(len(da2))
+                da_list.append(da2)
+        else:
+            times = da[time_dim]
             times = times.rename({time_dim: 'rest'})
             times.coords['rest'] = range(len(times))
             t_list.append(times)
-            da2 = da2.rename({time_dim: 'rest'})
-            da2.coords['rest'] = range(len(da2))
-            da_list.append(da2)
+            da = da.rename({time_dim: 'rest'})
+            da.coords['rest'] = range(len(da))
+            da_list.append(da)
     # get group keys:
     grps1 = [x for x in grp_obj1.groups.keys()]
-    grps2 = [x for x in grp_obj2.groups.keys()]
+    if grp2 is not None:
+        grps2 = [x for x in grp_obj2.groups.keys()]
     # concat and convert to dataset:
     stacked_ds = xr.concat(da_list, dim='all').to_dataset(name=name)
     stacked_ds[time_dim] = xr.concat(t_list, 'all')
-    # create a multiindex for the groups:
-    mindex = pd.MultiIndex.from_product([grps1, grps2], names=[grp1, grp2])
-    stacked_ds.coords['all'] = mindex
+    if grp2 is not None:
+        # create a multiindex for the groups:
+        mindex = pd.MultiIndex.from_product([grps1, grps2], names=[grp1, grp2])
+        stacked_ds.coords['all'] = mindex
+    else:
+        # create a multiindex for first group only:
+        mindex = pd.MultiIndex.from_product([grps1], names=[grp1])
+        stacked_ds.coords['all'] = mindex
     # unstack:
     ds = stacked_ds.unstack('all')
     ds.attrs = attrs
-    if plot:
-        plot_stacked_time_series(ds[name].mean('rest', keep_attrs=True))
+#    if plot:
+#        plot_stacked_time_series(ds[name].mean('rest', keep_attrs=True))
     return ds
 
 
@@ -1638,13 +2301,24 @@ def dt_to_np64(time_coord, unit='m', convert_back=False):
     return new_time
 
 
-def xr_reindex_with_date_range(ds, drop=True, freq='5min'):
+def xr_reindex_with_date_range(ds, drop=True, time_dim=None, freq='5min',
+                               dt_min=None, dt_max=None):
+    """be careful when drop=True in datasets that have various nans in dataarrays"""
     import pandas as pd
-    time_dim = list(set(ds.dims))[0]
+    if time_dim is None:
+        time_dim = list(set(ds.dims))[0]
     if drop:
         ds = ds.dropna(time_dim)
-    start = pd.to_datetime(ds[time_dim].min().item())
-    end = pd.to_datetime(ds[time_dim].max().item())
+    if dt_min is not None:
+        dt_min = pd.to_datetime(dt_min)
+        start = pd.to_datetime(dt_min)
+    else:
+        start = pd.to_datetime(ds[time_dim].min().item())
+    if dt_max is not None:
+        dt_max = pd.to_datetime(dt_max)
+        end = pd.to_datetime(dt_max)
+    else:
+        end = pd.to_datetime(ds[time_dim].max().item())
     new_time = pd.date_range(start, end, freq=freq)
     ds = ds.reindex({time_dim: new_time})
     return ds
@@ -1685,6 +2359,27 @@ def filter_nan_errors(ds, error_str='_error', dim='time', meta='action'):
             ', filtered values with NaN errors',
             append)
     return ds
+
+
+def smooth_xr(da, dim='time', weights=[0.25, 0.5, 0.25]):
+    # fix to accept wither da or ds:
+    import xarray as xr
+    weight = xr.DataArray(weights, dims=['window'])
+    if isinstance(da, xr.Dataset):
+        attrs = dict(zip(da.data_vars, [da[x].attrs for x in da]))
+        da_roll = da.to_array('dummy').rolling(
+            {dim: len(weights)}, center=True).construct('window').dot(weight)
+        da_roll = da_roll.to_dataset('dummy')
+        for das, attr in attrs.items():
+            da_roll[das].attrs = attr
+            da_roll[das].attrs['action'] = 'weighted rolling mean with {} on {}'.format(
+                weights, dim)
+    else:
+        da_roll = da.rolling({dim: len(weights)},
+                             center=True).construct('window').dot(weight)
+        da_roll.attrs['action'] = 'weighted rolling mean with {} on {}'.format(
+            weights, dim)
+    return da_roll
 
 
 def keep_iqr(da, dim='time', qlow=0.25, qhigh=0.75, k=1.5, drop_with_freq=None,
@@ -1955,6 +2650,88 @@ def process_gridsearch_results(GridSearchCV):
     return ds
 
 
+def calculate_std_error(arr, statistic='std'):
+    from scipy.stats import moment
+    import numpy as np
+    # remove nans:
+    arr = arr[np.logical_not(np.isnan(arr))]
+    n = len(arr)
+    if statistic == 'std':
+        mu4 = moment(arr, moment=4)
+        sig4 = np.var(arr)**2.0
+        se = mu4 - sig4 * (n - 3) / (n - 1)
+        se = (se / n)**0.25
+    elif statistic == 'mean':
+        std = np.std(arr)
+        se = std / np.sqrt(n)
+    return se
+
+
+def calculate_distance_between_two_lat_lon_points(
+        lat1,
+        lon1,
+        lat2,
+        lon2,
+        orig_epsg='4326',
+        meter_epsg='2039',
+        verbose=False):
+    """calculate the distance between two points (lat,lon) with epsg of
+    WGS84 and convert to meters with a local epsg. if lat1 is array then
+    calculates the distance of many points."""
+    import geopandas as gpd
+    import pandas as pd
+    try:
+        df1 = pd.DataFrame(index=lat1.index)
+    except AttributeError:
+        try:
+            len(lat1)
+        except TypeError:
+            lat1 = [lat1]
+        df1 = pd.DataFrame(index=[x for x in range(len(lat1))])
+    df1['lat'] = lat1
+    df1['lon'] = lon1
+    first_gdf = gpd.GeoDataFrame(
+        df1, geometry=gpd.points_from_xy(
+            df1['lon'], df1['lat']))
+    first_gdf.crs = {'init': 'epsg:{}'.format(orig_epsg)}
+    first_gdf.to_crs(epsg=int(meter_epsg), inplace=True)
+    try:
+        df2 = pd.DataFrame(index=lat2.index)
+    except AttributeError:
+        try:
+            len(lat2)
+        except TypeError:
+            lat2 = [lat2]
+        df2 = pd.DataFrame(index=[x for x in range(len(lat2))])
+    df2['lat'] = lat2
+    df2['lon'] = lon2
+    second_gdf = gpd.GeoDataFrame(
+        df2, geometry=gpd.points_from_xy(
+            df2['lon'], df2['lat']))
+    second_gdf.crs = {'init': 'epsg:{}'.format(orig_epsg)}
+    second_gdf.to_crs(epsg=int(meter_epsg), inplace=True)
+    ddf = first_gdf.geometry.distance(second_gdf.geometry)
+    return ddf
+
+
+def get_nearest_lat_lon_for_xy(lat_da, lon_da, points):
+    """used to access UERRA reanalysis, where the variable has x,y as coords"""
+    import numpy as np
+    from scipy.spatial import cKDTree
+    if isinstance(points, np.ndarray):
+        points = list(points)
+    combined_x_y_arrays = np.dstack(
+        [lat_da.values.ravel(), lon_da.values.ravel()])[0]
+    mytree = cKDTree(combined_x_y_arrays)
+    points = np.atleast_2d(points)
+    dist, inds = mytree.query(points)
+    yx = []
+    for ind in inds:
+        y, x = np.unravel_index(ind, lat_da.shape)
+        yx.append([y, x])
+    return yx
+
+
 def coarse_dem(data, dem_path=work_yuval / 'AW3D30'):
     """coarsen to data coords"""
     # data is lower resolution than awd
@@ -1980,6 +2757,21 @@ def coarse_dem(data, dem_path=work_yuval / 'AW3D30'):
         awds.to_netcdf(dem_path / filename)
         print('{} is saved to {}'.format(filename, dem_path))
     return awds
+
+
+def invert_dict(d):
+    """unvert dict"""
+    inverse = dict()
+    for key in d:
+        # Go through the list that is saved in the dict:
+        for item in d[key]:
+            # Check if in the inverted dict the key exists
+            if item not in inverse:
+                # If not create a new list
+                inverse[item] = key
+            else:
+                inverse[item].append(key)
+    return inverse
 
 
 def concat_shp(path, shp_file_list, saved_filename):
@@ -2068,7 +2860,13 @@ def get_unique_index(da, dim='time', verbose=False):
 def Zscore_xr(da, dim='time'):
     """input is a dattarray of data and output is a dattarray of Zscore
     for the dim"""
+    attrs = da.attrs
     z = (da - da.mean(dim=dim)) / da.std(dim=dim)
+    z.attrs = attrs
+    if 'units' in attrs.keys():
+        z.attrs['old_units'] = attrs['units']
+    z.attrs['action'] = 'converted to Z-score'
+    z.attrs['units'] = 'std'
     return z
 
 
