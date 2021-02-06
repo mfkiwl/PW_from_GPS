@@ -8,7 +8,7 @@ work flow for ZWD and PW retreival after python copy_gipsyx_post_from_geo.py:
     3)use mean_ZWD_over_sound_time_and_fit_tstm to obtain the mda (model dataarray)
     3*) can't use produce_kappa_ml_with_cats for hour on 5 mins data, dahhh!
     can do that with dayofyear, month, season (need to implement it first)
-    4)save_GNSS_PW_israeli_stations using mda (e.g., season) from  3 
+    4)save_GNSS_PW_israeli_stations using mda (e.g., season) from  3
     5) do homogenization using Homogenization_R.py and run homogenize_pw_dataset
     6) for hydro analysis and more run produce_all_GNSS_PW_anomalies
 @author: shlomi
@@ -94,7 +94,7 @@ class LinearRegression_with_stats(LinearRegression):
         # Degrees of freedom.
         df = float(n-k-1)
 
-        # Sample variance.     
+        # Sample variance.
         sse = np.sum(np.square(yHat - y),axis=0)
         self.sampleVariance = sse/df
 
@@ -112,7 +112,7 @@ class LinearRegression_with_stats(LinearRegression):
         for i in range(len(self.se)):
             self.betasTStat[i] = self.coef_[i]/self.se[i]
 
-        # P-value for each beta. This is a two sided t-test, since the betas can be 
+        # P-value for each beta. This is a two sided t-test, since the betas can be
         # positive or negative.
         self.betasPValue = 1 - stats.t.cdf(abs(self.betasTStat),df)
         return self
@@ -245,6 +245,7 @@ def produce_PWV_flux_from_ERA5_UVQ(
 def produce_era5_field_at_gnss_coords(era5_da, savepath=None,
                                       pw_path=work_yuval):
     import xarray as xr
+    from aux_gps import save_ncfile
     print('reading ERA5 {} field.'.format(era5_da.name))
     gps = produce_geo_gnss_solved_stations(plot=False)
     era5_pw_list = []
@@ -258,6 +259,12 @@ def produce_era5_field_at_gnss_coords(era5_da, savepath=None,
         da = da.reset_coords(drop=True)
         era5_pw_list.append(da)
     ds = xr.merge(era5_pw_list)
+    if savepath is not None:
+        name = era5_da.name
+        yrmin = era5_da['time'].dt.year.min().item()
+        yrmax = era5_da['time'].dt.year.max().item()
+        filename = 'GNSS_ERA5_{}_{}-{}.nc'.format(name, yrmin, yrmax)
+        save_ncfile(ds, savepath, filename)
     return ds
 
 
@@ -637,7 +644,7 @@ def produce_zwd_from_sounding_and_compare_to_gps(phys_sound_file=phys_soundings,
         axes[0].set_title('Zenith wet delay from Bet-Dagan radiosonde station and TELA GNSS satation')
         sonde_change_x = pd.to_datetime('2013-08-20')
         axes[1].axvline(sonde_change_x, color='red')
-        axes[1].annotate('changed sonde type from VIZ MK-II to PTU GPS', (mdates.date2num(sonde_change_x), 15), xytext=(15, 15), 
+        axes[1].annotate('changed sonde type from VIZ MK-II to PTU GPS', (mdates.date2num(sonde_change_x), 15), xytext=(15, 15),
             textcoords='offset points', arrowprops=dict(arrowstyle='fancy', color='red'), color='red')
         # axes[1].set_aspect(3)
         plt.tight_layout()
@@ -706,17 +713,18 @@ def mean_ZWD_over_sound_time_and_fit_tstm(path=work_yuval,
     from aux_gps import multi_time_coord_slice
     from aux_gps import path_glob
     from aux_gps import xr_reindex_with_date_range
+    from sounding_procedures import load_field_from_radiosonde
     from sounding_procedures import get_field_from_radiosonde
     """mean the WetZ over the gps station soundings datetimes to get a more
         accurate realistic measurement comparison to soundings"""
-    tpw = get_field_from_radiosonde(path=sound_path, field='PW', data_type=data_type,
-                                    reduce='max',dim='Height', plot=False, times=times)
+    # tpw = load_field_from_radiosonde(path=sound_path, field='PW', data_type=data_type,
+    #                                 reduce='max',dim='Height', plot=False)
     min_time = get_field_from_radiosonde(path=sound_path, field='min_time', data_type='phys',
-                                         reduce=None, plot=False, times=times)
+                                         reduce=None, plot=False)
     max_time = get_field_from_radiosonde(path=sound_path, field='max_time', data_type='phys',
-                                         reduce=None, plot=False, times=times)
+                                         reduce=None, plot=False)
     sound_time = get_field_from_radiosonde(path=sound_path, field='sound_time', data_type='phys',
-                                           reduce=None, plot=False, times=times)
+                                           reduce=None, plot=False)
     min_time = min_time.dropna('sound_time').values
     max_time = max_time.dropna('sound_time').values
     # load the zenith wet daley for GPS (e.g.,TELA) station:
@@ -741,7 +749,7 @@ def mean_ZWD_over_sound_time_and_fit_tstm(path=work_yuval,
     ds['{}_error'.format(gps_station)] = zwd_error.groupby(
         zwd[da_group.name]).mean('time')
     ds['sound_time'] = sound_time.dropna('sound_time')
-    ds['tpw_bet_dagan'] = tpw
+    # ds['tpw_bet_dagan'] = tpw
     wetz = ds['{}'.format(gps_station)]
     wetz_error = ds['{}_error'.format(gps_station)]
     # do the same for surface temperature:
@@ -759,7 +767,7 @@ def mean_ZWD_over_sound_time_and_fit_tstm(path=work_yuval,
     ts_sound = ts_sound.rename({'sound_time': 'time'})
     # prepare ts-tm data:
     tm = get_field_from_radiosonde(path=sound_path, field='Tm', data_type=data_type,
-                                   reduce='min', dim='Height', plot=False)
+                                   reduce=None, dim='Height', plot=False)
     ts = get_field_from_radiosonde(path=sound_path, field='Ts', data_type=data_type,
                                    reduce=None, dim='Height', plot=False)
     tstm = xr.Dataset()
@@ -777,7 +785,7 @@ def mean_ZWD_over_sound_time_and_fit_tstm(path=work_yuval,
         wetz_error**2.0 + dk**2.0)
     # divide by kappa calculated from bet_dagan ts to get bet_dagan zwd:
     k = kappa(tm, Tm_input=True)
-    ds['zwd_bet_dagan'] = ds['tpw_bet_dagan'] / k
+    # ds['zwd_bet_dagan'] = ds['tpw_bet_dagan'] / k
     return ds, mda
 
 
@@ -1072,7 +1080,7 @@ def parameter_study_ts_tm_TELA_bet_dagan(tel_aviv_IMS_file, path=work_yuval,
 #    X = [x for x in allLines if 'XLR coordinate' in x][0].split()[-1]
 #    Y = [x for x in allLines if 'Y coordinate' in x][0].split()[-1]
 #    Z = [x for x in allLines if 'Z coordinate' in x][0].split()[-1]
-# 
+#
 ## Convert JSON to dict and print
 #print(response.json())
 
@@ -1216,11 +1224,12 @@ def produce_geo_gnss_solved_stations(path=gis_path,
             'csar',
             'tela',
             'alon',
-            'slom']}
+            'slom',
+            'nizn']}
     highland_dict = {key: 1 for (key) in
                      ['nzrt', 'mrav', 'yosh', 'jslm', 'klhv', 'yrcm', 'ramo']}
     eastern_dict = {key: 2 for (key) in
-                    ['elro', 'katz', 'drag', 'dsea', 'nrif', 'elat']}
+                    ['elro', 'katz', 'drag', 'dsea', 'spir', 'nrif', 'elat']}
     groups_dict = {**coastal_dict, **highland_dict, **eastern_dict}
     stations['groups_annual'] = pd.Series(groups_dict)
     # define groups with climate code
@@ -1240,7 +1249,7 @@ def produce_geo_gnss_solved_stations(path=gis_path,
     gr2_dict = {key: 1 for (key) in
                 ['slom', 'klhv', 'yrcm', 'drag']}
     gr3_dict = {key: 2 for (key) in
-                ['ramo', 'dsea', 'nrif', 'elat']}
+                ['nizn', 'ramo', 'dsea', 'spir', 'nrif', 'elat']}
     groups_dict = {**gr1_dict, **gr2_dict, **gr3_dict}
     stations['groups_climate'] = pd.Series(groups_dict)
     if climate_path is not None:
@@ -1469,6 +1478,52 @@ def produce_geo_df(gis_path=gis_path, plot=True):
 #                        textcoords="offset points")
         plt.tight_layout()
     return ims, gps
+
+
+def save_GNSS_PWV_hydro_stations(path=work_yuval, stacked=False, sd=False):
+    import xarray as xr
+    from aux_gps import save_ncfile
+    from aux_gps import time_series_stack
+    if not stacked:
+        file = path / 'ZWD_thresh_0_for_hydro_analysis.nc'
+        zwd = xr.load_dataset(file)
+        ds, mda = mean_ZWD_over_sound_time_and_fit_tstm()
+        ds = save_GNSS_PW_israeli_stations(model_name='TSEN',
+                                           thresh=0,mda=mda,
+                                           extra_name='for_hydro_analysis')
+    else:
+        if stacked == 'stack':
+            file = path / 'GNSS_PW_thresh_0_for_hydro_analysis.nc'
+            pwv = xr.open_dataset(file)
+            pwv = pwv[[x for x in pwv if '_error' not in x]]
+            pwv.load()
+            pwv_stacked = pwv.map(time_series_stack, grp2='dayofyear', return_just_stacked_da=True)
+            filename = 'GNSS_PW_thresh_0_hour_dayofyear_rest.nc'
+            save_ncfile(pwv_stacked, path, filename)
+        elif stacked == 'unstack':
+            file = path / 'GNSS_PW_thresh_0_for_hydro_analysis.nc'
+            pwv = xr.open_dataset(file)
+            pwv = pwv[[x for x in pwv if '_error' not in x]]
+            pwv.load()
+            pwv = pwv.map(produce_PWV_anomalies_from_stacked_groups,
+                          grp1='hour', grp2='dayofyear', plot=False, standartize=sd)
+            if sd:
+                filename = 'GNSS_PW_thresh_0_hour_dayofyear_anoms_sd.nc'
+            else:
+                filename = 'GNSS_PW_thresh_0_hour_dayofyear_anoms.nc'
+            save_ncfile(pwv, path, filename)
+    return
+
+
+def save_GNSS_ZWD_hydro_stations(path=work_yuval):
+    import xarray as xr
+    from aux_gps import save_ncfile
+    file = path / 'ZWD_unselected_israel_1996-2020.nc'
+    zwd = xr.load_dataset(file)
+    # zwd = zwd[[x for x in zwd.data_vars if '_error' not in x]]
+    filename = 'ZWD_thresh_0_for_hydro_analysis.nc'
+    save_ncfile(zwd, path, filename)
+    return
 
 
 def save_GNSS_PW_israeli_stations(path=work_yuval, ims_path=ims_path,
@@ -2077,10 +2132,17 @@ def kappa(T, Tmul=0.72, T_offset=70.2, k2=22.1, k3=3.776e5, Tm_input=False):
     return k
 
 
-def calculate_ZHD(pressure, lat=30.0, ht_km=0.5):
+def calculate_ZHD(pressure, lat=30.0, ht_km=0.5,
+                  pressure_station_height_km=None):
     import numpy as np
     import xarray as xr
     lat_rad = np.deg2rad(lat)
+    if pressure_station_height_km is not None:
+        # adjust pressure accrding to pressure lapse rate taken empirically
+        # from IMS stations and pressure stations_height in kms:
+        plr_km_hPa = -112.653  # hPa / km
+        height_diff_km = ht_km - pressure_station_height_km
+        pressure += plr_km_hPa * height_diff_km
     ZHD = 0.22794 * pressure / \
         (1 - 0.00266 * np.cos(2 * lat_rad) - 0.00028 * ht_km)
     if not isinstance(ZHD, xr.DataArray):
@@ -2883,7 +2945,7 @@ def formulate_plot(ds, model_names=['LR', 'TSEN'],
                         # axes[i, j].plot(linex, liney, c='r')
                         # axes[i, j].plot(ts.values, ts.values, c='k', alpha=0.2)
                         min_, max_ = axes[i, j].get_ylim()
-    
+
                         [axes[i, j].text(0.01, pos[k],
                                          '{} a: {:.2f}, b: {:.2f}'.format(model_names[k],
                                                                           coefs[k],
@@ -3239,8 +3301,8 @@ def calculate_diurnal_variability(path=work_yuval, with_amp=False):
     return df
 
 
-def perform_harmonic_analysis_all_GNSS(path=work_yuval, n=6,
-                                       savepath=work_yuval):
+def perform_diurnal_harmonic_analysis_all_GNSS(path=work_yuval, n=6,
+                                               savepath=work_yuval):
     import xarray as xr
     from aux_gps import harmonic_analysis_xr
     from aux_gps import save_ncfile
@@ -3406,7 +3468,63 @@ def produce_all_GNSS_PW_anomalies(load_path=work_yuval, thresh=50,
     return GNSS_pw_anom
 
 
-def produce_PW_anomalies(pw_da, grp1='hour', grp2='dayofyear', plot=True):
+def perform_annual_harmonic_analysis_all_GNSS(path=work_yuval,
+                                              era5=False, n=6, keep_full_years=True):
+    from aux_gps import harmonic_da_ts
+    from aux_gps import save_ncfile
+    from aux_gps import keep_full_years_of_monthly_mean_data
+    import xarray as xr
+    from aux_gps import anomalize_xr
+    if era5:
+        pw = xr.load_dataset(path / 'GNSS_era5_monthly_PW.nc')
+    else:
+        pw = xr.load_dataset(path / 'GNSS_PW_monthly_thresh_50.nc')
+    if keep_full_years:
+        print('kept full years only')
+        pw = pw.map(keep_full_years_of_monthly_mean_data, verbose=False)
+    pw = anomalize_xr(pw, freq='AS')
+    dss_list = []
+    for site in pw:
+        print('performing annual harmonic analysis for GNSS {} site:'.format(site))
+        # remove site mean:
+        pwv = pw[site] - pw[site].mean('time')
+        dss = harmonic_da_ts(pwv, n=n, grp='month')
+        dss_list.append(dss)
+    dss_all = xr.merge(dss_list)
+    dss_all.attrs['field'] = 'PWV'
+    dss_all.attrs['units'] = 'mm'
+    if era5:
+        filename = 'GNSS_PW_ERA5_harmonics_annual.nc'
+    else:
+        filename = 'GNSS_PW_harmonics_annual.nc'
+    save_ncfile(dss_all, path, filename)
+    return dss_all
+
+
+def produce_PWV_anomalies_from_stacked_groups(pw_da, grp1='hour', grp2='dayofyear',
+                                              standartize=False, plot=True):
+    """
+    use time_series_stack (return the whole ds including the time data)
+    to produce the anomalies per station. use standertize=True to divide the
+    anoms with std
+
+    Parameters
+    ----------
+    pw_da : TYPE
+        DESCRIPTION.
+    grp1 : TYPE, optional
+        DESCRIPTION. The default is 'hour'.
+    grp2 : TYPE, optional
+        DESCRIPTION. The default is 'dayofyear'.
+    plot : TYPE, optional
+        DESCRIPTION. The default is True.
+
+    Returns
+    -------
+    pw_anom : TYPE
+        DESCRIPTION.
+
+    """
     from aux_gps import time_series_stack
     import xarray as xr
     from aux_gps import get_unique_index
@@ -3417,14 +3535,17 @@ def produce_PW_anomalies(pw_da, grp1='hour', grp2='dayofyear', plot=True):
     fname = pw_da.name
     print('computing anomalies for {}'.format(fname))
     stacked_pw = time_series_stack(pw_da, time_dim=time_dim, grp1=grp1,
-                                   grp2=grp2, plot=False)
+                                   grp2=grp2, return_just_stacked_da=False)
     pw_anom = stacked_pw.copy(deep=True)
     attrs = pw_anom.attrs
     rest_dim = [x for x in stacked_pw.dims if x != grp1 and x != grp2][0]
     # compute mean on rest dim and remove it from stacked_da:
     rest_mean = stacked_pw[fname].mean(rest_dim)
+    rest_std = stacked_pw[fname].std(rest_dim)
     for rest in stacked_pw[rest_dim].values:
         pw_anom[fname].loc[{rest_dim: rest}] -= rest_mean
+        if standartize:
+            pw_anom[fname].loc[{rest_dim: rest}] /= rest_std
     # now, flatten anomalies to restore the time-series structure:
     vals = pw_anom[fname].values.ravel()
     times = pw_anom[time_dim].values.ravel()
@@ -3436,6 +3557,8 @@ def produce_PW_anomalies(pw_da, grp1='hour', grp2='dayofyear', plot=True):
     pw_anom = xr_reindex_with_date_range(pw_anom, freq=pw_anom.attrs['freq'])
     pw_anom.name = fname
     pw_anom.attrs['description'] = 'anomalies are computed from {} and {} groupings'.format(grp1, grp2)
+    if standartize:
+        pw_anom.attrs['action'] = 'data was also standartized'
     if plot:
         fig, (ax1, ax2) = plt.subplots(1, 2, gridspec_kw={'width_ratios': [4, 1]})
         pw = pw_anom.dropna(time_dim).values
@@ -4019,7 +4142,7 @@ def pettitt_test_on_pw(da_ts, sample=None, alpha=0.05):
 #    K=max(abs(U));
 #    pvalue=2*exp((-6*K^2)/(m^3+m^2));
 #    a=[loc; K ;pvalue];
-    return 
+    return
 
 def mann_kendall_trend_analysis(da_ts, alpha=0.05, seasonal=False, CI=False,
                                 season_selection=None, verbose=True):
@@ -4295,9 +4418,9 @@ def read_gps_axis_xlsx(path=work_yuval, field='ZWD'):
     return ds
 
 
-   
+
 #def analyze_sounding_and_formulatxe(sound_path=sound_path,
-    
+
 #                                   model_names = ['TSEN', 'LR'],
 #                                   res_save='LR'):
 #    import xarray as xr
@@ -4529,7 +4652,7 @@ def read_gps_axis_xlsx(path=work_yuval, field='ZWD'):
 ##    results['parameter'] = ['slope', 'intercept']
 #    # results.attrs['all_data_slope'] = a
 #    # results.attrs['all_data_intercept'] = b
-#    return 
+#    return
 
 
 class ML_Switcher(object):
@@ -4544,7 +4667,7 @@ class ML_Switcher(object):
     def LR(self):
         from sklearn.linear_model import LinearRegression
         return LinearRegression(n_jobs=-1, copy_X=True)
-    
+
     def LRS(self):
         lr = LinearRegression(n_jobs=-1, copy_X=True)
         return LinearRegression_with_stats(lr)

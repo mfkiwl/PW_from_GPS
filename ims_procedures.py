@@ -44,12 +44,29 @@ ims_units_dict = {
     'G': ''}
 
 
+def save_daily_IMS_params_at_GNSS_loc(ims_path=ims_path,
+                                      param_name='WS', stations=[x for x in gnss_ims_dict.keys()]):
+    import xarray as xr
+    from aux_gps import save_ncfile
+    param = xr.open_dataset(ims_path / 'IMS_{}_israeli_10mins.nc'.format(param_name))
+    ims_stns = [gnss_ims_dict.get(x) for x in stations]
+    param = param[ims_stns]
+    param = param.resample(time='D', keep_attrs=True).mean(keep_attrs=True)
+    inv_dict = {v: k for k, v in gnss_ims_dict.items()}
+    for da in param:
+        param = param.rename({da: inv_dict.get(da)})
+    filename = 'GNSS_{}_daily.nc'.format(param_name)
+    save_ncfile(param, ims_path, filename)
+    return param
+
+
 def produce_bet_dagan_long_term_pressure(path=ims_path, rate='1H',
-                                         savepath=None):
+                                         savepath=None, fill_from_jerusalem=True):
     import xarray as xr
     from aux_gps import xr_reindex_with_date_range
     from aux_gps import get_unique_index
     from aux_gps import save_ncfile
+    from aux_gps import anomalize_xr
     # load manual old measurements and new 3 hr ones:
     bd_man = xr.open_dataset(
         path / 'IMS_hourly_03hr.nc')['BET-DAGAN-MAN_2520_ps']
@@ -59,25 +76,64 @@ def produce_bet_dagan_long_term_pressure(path=ims_path, rate='1H',
     bd = get_unique_index(bd)
     bd = bd.sortby('time')
     bd = xr_reindex_with_date_range(bd, freq='1H')
-    bd_inter = bd.interpolate_na('time', max_gap='3H', method='cubic')
+    # remove dayofyear mean, interpolate and reconstruct signal to fill it with climatology:
+    climatology = bd.groupby('time.dayofyear').mean(keep_attrs=True)
+    bd_anoms = anomalize_xr(bd, freq='DOY')
+    bd_inter = bd_anoms.interpolate_na('time', method='cubic', max_gap='24H', keep_attrs=True)
+    # bd_inter = bd.interpolate_na('time', max_gap='3H', method='cubic')
+    bd_inter = bd_inter.groupby('time.dayofyear') + climatology
+    bd_inter = bd_inter.reset_coords(drop=True)
     # load 10-mins new measurements:
     bd_10 = xr.open_dataset(path / 'IMS_BP_israeli_hourly.nc')['BET-DAGAN']
     bd_10 = bd_10.dropna('time').sel(
         time=slice(
             '2019-06-30T00:00:00',
             None)).resample(
-                time='1H').mean()   
+                time='1H').mean()
     bd_inter = xr.concat([bd_inter, bd_10], 'time', join='inner')
     bd_inter = get_unique_index(bd_inter)
     bd_inter = bd_inter.sortby('time')
     bd_inter.name = 'bet-dagan'
     bd_inter.attrs['action'] = 'interpolated from 3H'
+    if fill_from_jerusalem:
+        print('filling missing gaps from 2018 with jerusalem')
+        jr_10 = xr.load_dataset(
+            path / 'IMS_BP_israeli_hourly.nc')['JERUSALEM-CENTRE']
+        climatology = bd_inter.groupby('time.dayofyear').mean(keep_attrs=True)
+        jr_10_anoms = anomalize_xr(jr_10, 'DOY')
+        bd_anoms = anomalize_xr(bd_inter, 'DOY')
+        bd_anoms = xr.concat(
+            [bd_anoms.dropna('time'), jr_10_anoms.dropna('time')], 'time', join='inner')
+        bd_anoms = get_unique_index(bd_anoms)
+        bd_anoms = bd_anoms.sortby('time')
+        bd_anoms = xr_reindex_with_date_range(bd_anoms, freq='5T')
+        bd_anoms = bd_anoms.interpolate_na('time', method='cubic', max_gap='2H')
+        bd_anoms.name = 'bet-dagan'
+        bd_anoms.attrs['action'] = 'interpolated from 3H'
+        bd_anoms.attrs['filled'] = 'using Jerusalem-centre'
+        bd_anoms.attrs['long_name'] = 'Pressure Anomalies'
+        bd_anoms.attrs['units'] = 'hPa'
+        bd_inter = bd_anoms.groupby('time.dayofyear') + climatology
+        bd_inter = bd_inter.resample(time='1H', keep_attrs=True).mean(keep_attrs=True)
+        # if savepath is not None:
+        #     yr_min = bd_anoms.time.min().dt.year.item()
+        #     yr_max = bd_anoms.time.max().dt.year.item()
+        #     filename = 'IMS_BD_anoms_5min_ps_{}-{}.nc'.format(
+        #         yr_min, yr_max)
+        #     save_ncfile(bd_anoms, savepath, filename)
+        # return bd_anoms
     if savepath is not None:
-        filename = 'IMS_BD_hourly_ps.nc'
+        # filename = 'IMS_BD_hourly_ps.nc'
         yr_min = bd_inter.time.min().dt.year.item()
         yr_max = bd_inter.time.max().dt.year.item()
         filename = 'IMS_BD_hourly_ps_{}-{}.nc'.format(yr_min, yr_max)
         save_ncfile(bd_inter, savepath, filename)
+        bd_anoms = anomalize_xr(bd_inter, 'DOY', units='std')
+        filename = 'IMS_BD_hourly_anoms_std_ps_{}-{}.nc'.format(yr_min, yr_max)
+        save_ncfile(bd_anoms, savepath, filename)
+        bd_anoms = anomalize_xr(bd_inter, 'DOY')
+        filename = 'IMS_BD_hourly_anoms_ps_{}-{}.nc'.format(yr_min, yr_max)
+        save_ncfile(bd_anoms, savepath, filename)
     return bd_inter
 
 
@@ -292,7 +348,7 @@ def produce_gustiness(path=ims_path,
         _, y2 = ax2.transData.transform((0, v2))
         adjust_yaxis(ax2,(y1-y2)/2,v2)
         adjust_yaxis(ax1,(y2-y1)/2,v1)
-    
+
     def adjust_yaxis(ax,ydif,v):
         """shift axis ax by ydiff, maintaining point v at the same location"""
         inv = ax.transData.inverted()
@@ -647,7 +703,7 @@ def IMS_interpolating_to_GNSS_stations_israel(dt='2013-10-19T22:00:00',
 #        except TypeError as e:
 #            print('{}, dt: {}'.format(e, dt))
 #            print(ts_vs_alt)
-#            return 
+#            return
         if lapse_rate == 'auto':
             lapse_rate = np.abs(a) * 1000
             if lapse_rate < 5.0:
@@ -787,7 +843,7 @@ def IMS_interpolating_to_GNSS_stations_israel(dt='2013-10-19T22:00:00',
                 dt_col = dt.strftime('%Y-%m-%d %H:%M')
                 if np.mod(cnt, 144) == 0:
                     # t1 = time.time()
-                    print('working on {}'.format(dt_col)) 
+                    print('working on {}'.format(dt_col))
                     # print('time1:{:.2f} seconds'.format(t1-t0))
                     # t0 = time.time()
                 # prepare the ims coords and temp df(Tloc_df) and
@@ -904,7 +960,7 @@ def resample_GNSS_TD(path=ims_path):
               'D': 'Daily', 'W': 'weekly', 'MS': 'monthly'}
     for key in sample.keys():
         resample_GNSS_TD(ds, path, sample, sample_rate=key)
-    
+
 #    for sta in stations:
 #        # take each station's TD and copy to GNSS folder 'temperature':
 #        savepath = GNSS / sta / 'temperature'
@@ -1128,7 +1184,7 @@ def Interpolating_models_ims(time='2013-10-19T22:00:00', var='TD', plot=True,
         if hasattr(estimator, 'best_score_'):
             print('best_score = {:.3f}'.format(estimator.best_score_))
             print('best_params = ', estimator.best_params_)
-        
+
         return estimator
 #    if (cv is not None and not u):
 #        from sklearn import metrics
@@ -1789,7 +1845,7 @@ def fill_fix_all_10mins_IMS_stations(path=ims_10mins_path,
                 print('{} station is sliced!'.format(da.name))
             elif da.name == 'JERUSALEM-CENTRE':
                 da = da.loc['1995-11-13':]
-                print('{} station is sliced!'.format(da.name))                
+                print('{} station is sliced!'.format(da.name))
             elif da.name == 'NETIV-HALAMED-HE':
                 da = da.loc['1995-10-15':]
                 print('{} station is sliced!'.format(da.name))

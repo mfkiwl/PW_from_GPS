@@ -11,6 +11,13 @@ from PW_paths import work_yuval
 # TODO: check if lmfit accepts- datetimeindex, xarrays and NaNs.
 # TODO: if not, build func to replace datetimeindex to numbers and vise versa
 
+# def high_sample_and_smooth_dataframe_time_series(df):
+#     import pandas as pd
+#     dfs = df.copy()
+#     dfs.index = pd.to_timedelta(dfs.index, unit='d')
+#     dfs = dfs.resample('15S').interpolate(method='cubic').T.mean().resample('5T').mean()
+#     better = better.reset_index(drop=True)
+#     better.index = np.arange(-days_prior, days_after, 1/pts_per_day)
 
 def replace_xarray_time_series_with_its_group(da, grp='month', time_dim='time'):
     """run the same func on each dim in da"""
@@ -68,8 +75,8 @@ def replace_xarray_time_series_with_its_group(da, grp='month', time_dim='time'):
 
 
 def replace_time_series_with_its_group(da_ts, grp='month'):
-    """ replace an xarray time series with its mean grouping e.g., time.month, 
-    time.dayofyear, time.hour etc.., basiaclly implement .transform method 
+    """ replace an xarray time series with its mean grouping e.g., time.month,
+    time.dayofyear, time.hour etc.., basiaclly implement .transform method
     on 1D dataarray, index must be datetime"""
     import xarray as xr
     import pandas as pd
@@ -273,7 +280,9 @@ def linear_fit_using_scipy_da_ts(da_ts, model='TSEN', slope_factor=3650.25,
     if not_time:
         X = da_ts[time_dim].values.reshape(-1, 1)
         jul_no_nans = da_ts.dropna(time_dim)[time_dim].values
+        # jul_no_nans -= np.median(jul_no_nans)
         jul = da_ts[time_dim].values
+        # jul -= np.median(jul)
     else:
         jul, jul_no_nans = get_julian_dates_from_da(da_ts, subtract='median')
         X = jul_no_nans.reshape(-1, 1)
@@ -332,6 +341,35 @@ def linear_fit_using_scipy_da_ts(da_ts, model='TSEN', slope_factor=3650.25,
     results_dict = {'slope_hi': slope_in_factor_scale_hi, 'slope_lo': slope_in_factor_scale_lo, 'slope': slope_in_factor_scale}
     results_dict['intercept'] = intercept
     return trend_ds, results_dict
+
+
+def scatter_plot_and_fit(df, x, y, color='b', ax=None):
+    import matplotlib.pyplot as plt
+    import seaborn as sns
+    if ax is None:
+        fig, ax = plt.subplots()
+    sns.scatterplot(x=x, y=y, data=df, ax=ax, color=color, s=10)
+
+
+def linear_regression_scikit_learn(da1, da2, same_dim='time'):
+    from sklearn.metrics import mean_squared_error
+    from sklearn.linear_model import LinearRegression
+    import numpy as np
+    from aux_gps import dim_intersection
+    shared = dim_intersection([da1, da2])
+    da1 = da1.sel({same_dim: shared})
+    da2 = da2.sel({same_dim: shared})
+    X = da1.dropna(same_dim).values.reshape(-1, 1)
+    y = da2.dropna(same_dim).values
+    lr = LinearRegression()
+    lr.fit(X, y)
+    slope = lr.coef_[0]
+    inter = lr.intercept_
+    pred = lr.predict(X)
+    rmse = mean_squared_error(y, pred, squared=False)
+    resid = pred - y
+    mean = np.sum(resid)
+    return slope, inter, mean, rmse
 
 
 def split_equal_da_ts_around_datetime(da_ts, dt='2014-05-01'):
@@ -410,7 +448,7 @@ def homogeneity_test_xr(da_ts, hg_test_func, dropna=True, alpha=0.05,
     """False means data is homogenous, True means non-homogenous with significance alpha"""
     import xarray as xr
     import pandas as pd
-    time_dim = list(set(da_ts.dims))[0] 
+    time_dim = list(set(da_ts.dims))[0]
     if dropna:
         da_ts = da_ts.dropna(time_dim)
     h, cp, p, U, mu = hg_test_func(da_ts, alpha=alpha, sim=sim)
@@ -519,14 +557,17 @@ def select_months(da_ts, months, remove=False, reindex=True):
     return da
 
 
-def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
-                              ax=None, legend_loc=None, ncol=1, legsize=8):
+def run_MLR_harmonics(harmonic_dss, season=None, n_max=4,
+                      plot=True, cunits='cpd',
+                      ax=None, legend_loc=None, ncol=1,
+                      legsize=8, lw=1, legend_S_only=False):
+    """ change cunits to 'cpy' to process annual harmonics"""
     from sklearn.linear_model import LinearRegression
     from sklearn.metrics import explained_variance_score
     import matplotlib.pyplot as plt
     import numpy as np
-    if n_max > harmonic_dss.cpd.max().values.item():
-        n_max = harmonic_dss.cpd.max().values.item()
+    if n_max > harmonic_dss[cunits].max().values.item():
+        n_max = harmonic_dss[cunits].max().values.item()
     try:
         field = harmonic_dss.attrs['field']
         if field == 'PW':
@@ -541,20 +582,23 @@ def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
     elif season is not None:
         harmonic = harmonic_dss.sel(season=season)
     # pre-proccess:
-    harmonic = harmonic.transpose('hour', 'cpd', ...)
-    harmonic = harmonic.sel(cpd=slice(1, n_max))
+    if 'month' in harmonic.dims:
+        harmonic = harmonic.transpose('month', cunits, ...)
+    elif 'hour' in harmonic.dims:
+        harmonic = harmonic.transpose('hour', cunits, ...)
+    harmonic = harmonic.sel({cunits: slice(1, n_max)})
     # X = harmonic[name + '_mean'].values
     y = harmonic[name].values.reshape(-1, 1)
     exp_list = []
-    for cpd in harmonic['cpd'].values:
-        X = harmonic[name + '_mean'].sel(cpd=cpd).values.reshape(-1, 1)
+    for cycle in harmonic[cunits].values:
+        X = harmonic[name + '_mean'].sel({cunits: cycle}).values.reshape(-1, 1)
         lr = LinearRegression(fit_intercept=False)
         lr.fit(X, y)
         y_pred = lr.predict(X)
         ex_var = explained_variance_score(y, y_pred)
         exp_list.append(ex_var)
     explained = np.array(exp_list) * 100.0
-    exp_dict = dict(zip([x for x in harmonic['cpd'].values], explained))
+    exp_dict = dict(zip([x for x in harmonic[cunits].values], explained))
     exp_dict['total'] = np.cumsum(explained)
     exp_dict['season'] = season
     exp_dict['name'] = name
@@ -562,22 +606,38 @@ def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
         if ax is None:
             fig, ax = plt.subplots(figsize=(8, 6))
         markers = ['s', 'x', '^', '>', '<', 'X']
-        colors = ['tab:blue', 'tab:red', 'tab:orange', 'tab:green',
+        colors = ['tab:cyan', 'tab:brown', 'tab:pink', 'tab:orange',
                   'tab:purple', 'tab:yellow']
-        styles = ['-', '--', '-.', ':', 'None', ' ']
-        for i, cpd in enumerate(harmonic['cpd'].values):
-            harmonic[name + '_mean'].sel(cpd=cpd).plot(ax=ax, linestyle=styles[i], color=colors[i]) # marker=markers[i])
-        harmonic[name + '_mean'].sum('cpd').plot(ax=ax, marker=None, color='k', alpha=0.7)
-        harmonic[name].plot(ax=ax, marker='o', linewidth=0., color='k', alpha=0.7)
-        S = ['S{}'.format(x) for x in harmonic['cpd'].values]
+        styles = ['--', '-.', ':', ' ', 'None', ' ']
+        S = ['S{}'.format(x) for x in harmonic[cunits].values]
         S_total = ['+'.join(S)]
-        S = ['S{} ({:.0f}%)'.format(x, exp_dict[int(x)]) for x in harmonic['cpd'].values]
-        ax.legend(
-            S + S_total + [field],
-            prop={'size': legsize},
-            framealpha=0.5,
-            fancybox=True,
-            loc=legend_loc, ncol=ncol, columnspacing=0.75, handlelength=1.0)
+        S = ['S{} ({:.0f}%)'.format(x, exp_dict[int(x)]) for x in harmonic[cunits].values]
+        for i, cycle in enumerate(harmonic[cunits].values):
+            harmonic[name + '_mean'].sel({cunits: cycle}).plot(ax=ax,
+                                                               linestyle=styles[i],
+                                                               color=colors[i],
+                                                               linewidth=lw,
+                                                               label=S[i]) # marker=markers[i])
+        harmonic[name + '_mean'].sum(cunits).plot(ax=ax, marker=None, color='k',
+                                                  alpha=0.7, linewidth=lw, label=S_total)
+        harmonic[name].plot(ax=ax, marker='o', linewidth=0., color='k', alpha=0.7, label=field)
+        handles, labels = ax.get_legend_handles_labels()
+        if legend_S_only:
+            handles1 = handles[:-2]
+            labels1 = labels[:-2]
+            ax.legend(
+                handles=handles1, labels=labels1,
+                prop={'size': legsize},
+                framealpha=0.5,
+                fancybox=True,
+                loc=legend_loc, ncol=ncol, columnspacing=0.75, handlelength=1.0)
+        else:
+            ax.legend(
+                S + S_total + [field],
+                prop={'size': legsize},
+                framealpha=0.5,
+                fancybox=True,
+                loc=legend_loc, ncol=ncol, columnspacing=0.75, handlelength=1.0)
 #        ax.grid()
         ax.set_xlabel('Time of day [UTC]')
         # ax.set_ylabel('{} anomalies [mm]'.format(field))
@@ -585,7 +645,10 @@ def run_MLR_diurnal_harmonics(harmonic_dss, season=None, n_max=4, plot=True,
             ax.set_title('Annual {} diurnal cycle for {} station'.format(field, name.upper()))
         else:
             ax.set_title('{} diurnal cycle for {} station in {}'.format(field, name.upper(), season))
-        return ax
+        if legend_S_only:
+            return ax, handles, labels
+        else:
+            return ax
     else:
         return exp_dict
 
@@ -681,7 +744,73 @@ def harmonic_da(da_ts, n=3, field=None, init=None):
     return ds
 
 
-def anomalize_xr(da_ts, freq='D', time_dim=None, verbose=True):  # i.e., like deseason
+def harmonic_da_ts(da_ts, n=3, grp='month'):
+    from aux_gps import fit_da_ts_to_sine_model
+    import xarray as xr
+    time_dim = list(set(da_ts.dims))[0]
+    harmonics = [x + 1 for x in range(n)]
+    if grp == 'month':
+        init_freqs = [x / 366 for x in harmonics]
+        cunits = 'cpy'
+        cu_name = 'cycles per year'
+    elif grp == 'hour':
+        init_freqs = harmonics
+        cunits = 'cpd'
+        cu_name = 'cycles per day'
+    params_list = []
+    di_mean_list = []
+    di_std_list = []
+    for cycle, init_freq in zip(harmonics, init_freqs):
+        print('fitting harmonic #{}'.format(cycle))
+        res = fit_da_ts_to_sine_model(
+            da_ts, init_freq=init_freq, verbose=False, plot=False)
+        name = da_ts.name.split('_')[0]
+        params_da = xr.DataArray([x for x in res.attrs.values()],
+                                 dims=['params', 'val_err'])
+        params_da['params'] = [x for x in res.attrs.keys()]
+        params_da['val_err'] = ['value', 'stderr']
+        params_da.name = name + '_params'
+        name = res.name.split('_')[0]
+        diurnal_mean = res.groupby('{}.{}'.format(time_dim, grp)).mean()
+        diurnal_std = res.groupby('{}.{}'.format(time_dim, grp)).std()
+        # diurnal_mean.attrs.update(attrs)
+        # diurnal_std.attrs.update(attrs)
+        diurnal_mean.name = name + '_mean'
+        diurnal_std.name = name + '_std'
+        params_list.append(params_da)
+        di_mean_list.append(diurnal_mean)
+        di_std_list.append(diurnal_std)
+    da_mean = xr.concat(di_mean_list, cunits)
+    da_std = xr.concat(di_std_list, cunits)
+    da_params = xr.concat(params_list, cunits)
+    ds = da_mean.to_dataset(name=da_mean.name)
+    ds[da_std.name] = da_std
+    ds[cunits] = harmonics
+    ds[cunits].attrs['long_name'] = cu_name
+    ds[da_params.name] = da_params
+    ds[da_ts.name] = da_ts.groupby('{}.{}'.format(time_dim, grp)).mean(keep_attrs=True)
+    return ds
+
+
+def get_season_for_pandas_dtindex(df):
+    import pandas as pd
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise ValueError('index needs to be datetimeindex!')
+    season = []
+    months = [x.month for x in df.index]
+    for month in months:
+        if month <= 8 and month >=6:
+            season.append('JJA')
+        elif month <=5 and month >= 3:
+            season.append('MAM')
+        elif month >=9 and month<=11:
+            season.append('SON')
+        elif month == 12 or month == 1 or month ==2:
+            season.append('DJF')
+    return pd.Series(season, index=df.index)
+
+
+def anomalize_xr(da_ts, freq='D', time_dim=None, units=None, verbose=True):  # i.e., like deseason
     import xarray as xr
     if time_dim is None:
         time_dim = list(set(da_ts.dims))[0]
@@ -699,19 +828,47 @@ def anomalize_xr(da_ts, freq='D', time_dim=None, verbose=True):  # i.e., like de
             print('removing daily means from {}'.format(name))
         frq = 'daily'
         date = groupby_date_xr(da_ts)
-        da_anoms = da_ts.groupby(date) - da_ts.groupby(date).mean()
+        grp = date
     elif freq == 'H':
         if verbose:
             print('removing hourly means from {}'.format(name))
         frq = 'hourly'
-        da_anoms = da_ts.groupby('{}.hour'.format(
-            time_dim)) - da_ts.groupby('{}.hour'.format(time_dim)).mean()
+        grp = '{}.hour'.format(time_dim)
     elif freq == 'MS':
         if verbose:
             print('removing monthly means from {}'.format(name))
         frq = 'monthly'
-        da_anoms = da_ts.groupby('{}.month'.format(
-            time_dim)) - da_ts.groupby('{}.month'.format(time_dim)).mean()
+        grp = '{}.month'.format(time_dim)
+    elif freq == 'AS':
+        if verbose:
+            print('removing yearly means from {}'.format(name))
+        frq = 'yearly'
+        grp = '{}.year'.format(time_dim)
+    elif freq == 'DOY':
+        if verbose:
+            print('removing day of year means from {}'.format(name))
+        frq = 'dayofyear'
+        grp = '{}.dayofyear'.format(time_dim)
+    elif freq == 'WOY':
+        if verbose:
+            print('removing week of year means from {}'.format(name))
+        frq = 'weekofyear'
+        grp = '{}.weekofyear'.format(time_dim)
+    # calculate climatology:
+    climatology = da_ts.groupby(grp).mean()
+    climatology_std = da_ts.groupby(grp).std()
+    da_anoms = da_ts.groupby(grp) - climatology
+    if units == '%':
+        da_anoms = 100.0 * (da_anoms.groupby(grp) / climatology)
+        # da_anoms = 100.0 * (da_anoms / da_ts.mean())
+        # da_anoms = 100.0 * (da_ts.groupby(grp)/climatology - 1)
+        # da_anoms = 100.0 * (da_ts.groupby(grp)-climatology) / da_ts
+        if verbose:
+            print('Using % as units.')
+    elif units == 'std':
+        da_anoms = (da_anoms.groupby(grp) / climatology_std)
+        if verbose:
+            print('Using std as units.')
     da_anoms = da_anoms.reset_coords(drop=True)
     da_anoms.attrs.update(attrs)
     da_anoms.attrs.update(action='removed {} means'.format(frq))
@@ -720,6 +877,8 @@ def anomalize_xr(da_ts, freq='D', time_dim=None, verbose=True):  # i.e., like de
         for x in da_ts:
             da_anoms[x].attrs.update(da_attrs.get(x))
             da_anoms[x].attrs.update(action='removed {} means'.format(frq))
+            if units == '%':
+                da_anoms[x].attrs.update(units='%')
     return da_anoms
 
 
@@ -757,6 +916,38 @@ def grab_n_consecutive_epochs_from_ts(da_ts, sep='nan', n=10, time_dim=None,
         da_list.append(da)
     return da_list
 
+
+def keep_full_years_of_monthly_mean_data(da_ts, verbose=False):
+    name = da_ts.name
+    time_dim = list(set(da_ts.dims))[0]
+    df = da_ts.dropna(time_dim).to_dataframe()
+    # calculate yearly data to drop (if points less than threshold):
+    df['year'] = df.index.year
+    points_in_year = df.groupby(['year']).count()[name].to_frame()
+    # calculate total years with any data:
+    tot_years = points_in_year[points_in_year >0].dropna().count().values.item()
+    # calculate yealy data percentage (from maximum available):
+    points_in_year['percent'] = (points_in_year[name] / 12) * 100.0
+    # get the number of years to drop and the years themselves:
+    number_of_years_to_drop = points_in_year[name][points_in_year['percent'] <= 99].count()
+    percent_of_years_to_drop = 100.0 * \
+        number_of_years_to_drop / len(points_in_year)
+    years_to_drop = points_in_year.index[points_in_year['percent'] <= 99]
+    if verbose:
+        print('for {}: found {} ({:.2f} %) bad years with {:.0f} % drop thresh.'.format(
+                name, number_of_years_to_drop, percent_of_years_to_drop, 99))
+    # now drop the days:
+    for year_to_drop in years_to_drop:
+        df = df[df['year'] != year_to_drop]
+    if verbose:
+        print('for {}: kept {} years.'.format(name, df['year'].unique().size))
+    da = df[name].to_xarray()
+    # add some more metadata:
+    da.attrs['years_kept'] = sorted(df['year'].unique().tolist())
+    da.attrs['years_total'] = tot_years
+    da.attrs['years_dropped'] = number_of_years_to_drop
+    da.attrs['years_dropped_percent'] = '{:.1f}'.format(percent_of_years_to_drop)
+    return da
 
 #def assemble_semi_period(reduced_da_ts):
 #    import numpy as np
@@ -850,8 +1041,8 @@ def groupby_half_hour_xr(da_ts, reduce='mean'):
     return ds
 
 
-def groupby_date_xr(da_ts):
-    df = da_ts.to_dataframe()
+def groupby_date_xr(da_ts, time_dim='time'):
+    df = da_ts[time_dim].to_dataframe()
     df['date'] = df.index.date
     date = df['date'].to_xarray()
     return date
@@ -906,13 +1097,25 @@ def error_mean_rmse(y, y_pred):
     return mean, rmse
 
 
-def rename_data_vars(ds, suffix='_error', prefix=None, verbose=False):
+def remove_suffix_from_ds(ds, sep='_'):
     import xarray as xr
     if not isinstance(ds, xr.Dataset):
         raise ValueError('input must be an xarray dataset object!')
     vnames = [x for x in ds.data_vars]
-#    if remove_suffix:
-#        new_names = [x.replace(suffix, '') for x in ds.data_vars]
+    new_names = [x.split(sep)[0] for x in ds.data_vars]
+    name_dict = dict(zip(vnames, new_names))
+    ds = ds.rename_vars(name_dict)
+    return ds
+
+
+def rename_data_vars(ds, suffix='_error', prefix=None,
+                     verbose=False):
+    import xarray as xr
+    if not isinstance(ds, xr.Dataset):
+        raise ValueError('input must be an xarray dataset object!')
+    vnames = [x for x in ds.data_vars]
+    # if remove_suffix:
+    #     new_names = [x.replace(suffix, '') for x in ds.data_vars]
     if suffix is not None:
         new_names = [str(x) + suffix for x in ds.data_vars]
     if prefix is not None:
@@ -970,7 +1173,7 @@ def weighted_long_term_monthly_means_da(da_ts, plot=True):
     dfmm = df.groupby(['month', 'year']).mean()[name].to_frame()
     dfmm = pd.pivot_table(dfmm, index='year', columns='month')
     # wrong:
-#     weighted_monthly_means = dfmm * weights 
+#     weighted_monthly_means = dfmm * weights
     # normalize weights:
     wtag = weights / weights.sum(axis=0)
     weighted_clim = (dfmm*wtag).sum(axis=0).unstack().squeeze()
@@ -1141,7 +1344,8 @@ def get_all_possible_combinations_from_list(li, reduce_single_list=True):
 
 def gantt_chart(ds, fw='bold', ax=None, pe_dict=None, fontsize=14, linewidth=10,
                 title='RINEX files availability for the Israeli GNSS stations',
-                time_dim='time', antialiased=False):
+                time_dim='time', antialiased=False, colors=None, grid=False,
+                marker='x', marker_suffix='_tide'):
     import pandas as pd
     import matplotlib.pyplot as plt
     import numpy as np
@@ -1150,14 +1354,22 @@ def gantt_chart(ds, fw='bold', ax=None, pe_dict=None, fontsize=14, linewidth=10,
     from matplotlib.ticker import AutoMinorLocator
     import matplotlib.patheffects as pe
     # TODO: fix the ticks/ticks labels
-    sns.set_palette(sns.color_palette("tab10", len(ds)))
+    # sns.set_palette(sns.color_palette("tab10", len(ds)))
+    sns.set_palette(sns.color_palette("Dark2", len(ds)))
     if ax is None:
         fig, ax = plt.subplots(figsize=(20, 6))
-    names = [x for x in ds]
+    names = []
+    for x in ds:
+        if marker_suffix in x:
+            names.append('')
+        else:
+            names.append(x)
+    # names = [x for x in ds]
     vals = range(1, len(ds) + 1)
     xmin = pd.to_datetime(ds[time_dim].min().values) - pd.Timedelta(1, unit='W')
     xmax = pd.to_datetime(ds[time_dim].max().values) + pd.Timedelta(1, unit='W')
-    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    if colors is None:
+        colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 #    dt_min_list = []
 #    dt_max_list = []
     for i, da in enumerate(ds):
@@ -1169,21 +1381,30 @@ def gantt_chart(ds, fw='bold', ax=None, pe_dict=None, fontsize=14, linewidth=10,
             dt_max = df.iloc[A['{}_True_end'.format(da)]].index
         except IndexError:
             dt_max = df.iloc[A['{}_True_end'.format(da)][:-1]]
-            end = pd.DataFrame(index=[df.index[-1]], data=[False],columns=[da])
+            end = pd.DataFrame(index=[df.index[-1]], data=[False], columns=[da])
             dt_max = dt_max.append(end)
             dt_max = dt_max.index
         y = len(ds) + 1 - np.ones(dt_min.shape) * (i + 1)
+        y1 = len(ds) + 1 - np.ones(dt_min.shape) * (i + 0.5)
 #        y_list.append(y)
 #        dt_min_list.append(dt_min)
 #        dt_max_list.append(dt_max)
         # v = int(calc(i, max = len(ds)))
-        if pe_dict is not None:
-            ax.hlines(y, dt_min, dt_max, linewidth=linewidth, color=colors[i], path_effects=[pe.Stroke(linewidth=15, foreground='k'), pe.Normal()])
+        if marker_suffix in da:
+            x = pd.to_datetime(ds[da].dropna('time')['time'].values)
+            # print(x)
+            ax.scatter(x, y1, color=colors[i], marker=marker, s=150)
+            # ax.vlines(y, dt_min, dt_max, linewidth=1000, color=colors[i])
         else:
-            ax.hlines(y, dt_min, dt_max, linewidth=linewidth, color=colors[i], antialiased=antialiased)
+            if pe_dict is not None:
+                ax.hlines(y, dt_min, dt_max, linewidth=linewidth, color=colors[i], path_effects=[pe.Stroke(linewidth=15, foreground='k'), pe.Normal()])
+            else:
+                ax.hlines(y, dt_min, dt_max, linewidth=linewidth, color=colors[i], antialiased=antialiased)
         #plt.show()
         # ds[da][~ds[da].isnull()] = i + 1
         # ds[da] = ds[da].fillna(0)
+    if grid:
+        ax.grid(True, axis='x')
     # yticks and their labels:
     ax.set_yticks(vals)
     ax.set_yticklabels(names[::-1], fontweight=fw, fontsize=fontsize)
@@ -1225,7 +1446,7 @@ def time_series_stack_with_window(ts_da, time_dim='time',
     save also the datetimes"""
     import pandas as pd
     import xarray as xr
-    
+
     window_dt = pd.Timedelta(window)
     freq = pd.infer_freq(ts_da[time_dim].values)
     if not any(i.isdigit() for i in freq):
@@ -1284,7 +1505,7 @@ def annual_standertize(data, time_dim='time', std_nan=1.0):
     data.attrs.update(attrs)
     return data
 
-    
+
 def normalize_xr(data, time_dim='time', norm=1, down_bound=-1.,
                  upper_bound=1., verbose=True):
     attrs = data.attrs
@@ -1398,6 +1619,50 @@ def piecewise_linear_fit(da, k=1, plot=True):
     return da_final
 
 
+def convert_wind_direction(u=None, v=None, ws=None, wd=None, verbose=False):
+    """
+
+
+    Parameters
+    ----------
+    u : TYPE, optional
+        zonal direction. The default is None.
+    v : TYPE, optional
+        meridional direction. The default is None.
+    ws : TYPE, optional
+        magnitude. The default is None.
+    wd : TYPE, optional
+        meteorological direction. The default is None.
+    verbose : TYPE, optional
+        DESCRIPTION. The default is False.
+
+    Raises
+    ------
+    ValueError
+        DESCRIPTION.
+
+    Returns
+    -------
+    None.
+
+    """
+    import numpy as np
+    if (u is None and v is None) and (ws is not None and wd is not None):
+        if verbose:
+            print('converting from WS, WD to U, V')
+        u = -ws*np.sin(np.deg2rad(wd))
+        v = -ws*np.cos(np.deg2rad(wd))
+        return u, v
+    elif (u is not None and v is not None) and (ws is None and wd is None):
+        if verbose:
+            print('converting from U, V to WS, WD')
+        wd = 180 + np.rad2deg(np.arctan2(u, v))
+        ws = np.sqrt(u**2+v**2)
+        return ws, wd
+    else:
+        raise ValueError('choose either ws and wd or u and v!')
+
+
 def lmfit_params(model_name, k=None):
     from lmfit.parameter import Parameters
     sin_params = Parameters()
@@ -1480,6 +1745,57 @@ def fit_da_to_model(da, params=None, modelname='sin', method='leastsq', times=No
         fig, ax = plt.subplots(figsize=(8, 6))
         da.plot.line(marker='.', linewidth=0., color='b', ax=ax)
         dt = pd.to_datetime(da[time_dim].values)
+        ax.plot(dt, fit_y, c='r')
+        plt.legend(['data', 'fit'])
+    return fit
+
+
+def fit_da_ts_to_sine_model(da_ts, init_freq=1/366, verbose=False, plot=True):
+    """
+    Use lmfit MySineModel class to fit time series in DataArray
+
+    Parameters
+    ----------
+    da_ts : TYPE
+        DESCRIPTION.
+    plot : TYPE, optional
+        DESCRIPTION. The default is True.
+
+    Returns
+    -------
+    fitted_ds : Xarray Dataset
+        DESCRIPTION.
+
+    """
+    import xarray as xr
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    model = pick_lmfit_model(name='sine')
+    time_dim = list(set(da_ts.dims))[0]
+    jul, jul_no_nans = get_julian_dates_from_da(da_ts)
+    y = da_ts.dropna(time_dim).values
+    params = model.guess(data=y, freq=init_freq)
+    if verbose:
+        print(model)
+        print(params)
+    result = model.fit(data=y, params=params, x=jul_no_nans)
+    if not result.success:
+        raise ValueError('model not fitted properly...')
+    fit_y = result.eval(**result.best_values, x=jul)
+    fit = xr.DataArray(fit_y, dims=[time_dim])
+    fit[time_dim] = da_ts[time_dim]
+    fit.name = da_ts.name + '_fit'
+    p = {}
+    for name, param in result.params.items():
+        p[name] = [param.value, param.stderr]
+    fit.attrs.update(**p)
+    # return fit
+    if verbose:
+        print(result.best_values)
+    if plot:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        da_ts.plot.line(marker='.', linewidth=0., color='b', ax=ax)
+        dt = pd.to_datetime(da_ts[time_dim].values)
         ax.plot(dt, fit_y, c='r')
         plt.legend(['data', 'fit'])
     return fit
@@ -1913,10 +2229,10 @@ def choose_time_groupby_arg(da_ts, time_dim='time', grp='hour'):
 
 
 def time_series_stack(time_da, time_dim='time', grp1='hour', grp2='month',
-                      plot=True):
+                      return_just_stacked_da=False):
     """Takes a time-series xr.DataArray objects and reshapes it using
     grp1 and grp2. output is a xr.Dataset that includes the reshaped DataArray
-    , its datetime-series and the grps. plots the mean also"""
+    , its datetime-series and the grps."""
     import xarray as xr
     import pandas as pd
     # try to infer the freq and put it into attrs for later reconstruction:
@@ -1971,7 +2287,10 @@ def time_series_stack(time_da, time_dim='time', grp1='hour', grp2='month',
         mindex = pd.MultiIndex.from_product([grps1], names=[grp1])
         stacked_ds.coords['all'] = mindex
     # unstack:
+    # ds = stacked_ds.unstack('all')[time_da.name]
     ds = stacked_ds.unstack('all')
+    if return_just_stacked_da:
+        ds = ds[time_da.name]
     ds.attrs = attrs
 #    if plot:
 #        plot_stacked_time_series(ds[name].mean('rest', keep_attrs=True))
@@ -2992,3 +3311,30 @@ class lmfit_model_switcher(object):
         sum_sin = lmfit.pick_model('sum_sin', k)
         line = lmfit.pick_model('line', line_pre)
         return sum_sin + line
+
+
+def pick_lmfit_model(name='sine'):
+    import numpy as np
+    import lmfit
+
+    class MySineModel(lmfit.Model):
+        def __init__(self, *args, **kwargs):
+            def sine(x, ampl, offset, freq, x0):
+                return ampl * np.sin((x - x0)*2*np.pi*freq) + offset
+            super(MySineModel, self).__init__(sine, *args, **kwargs)
+
+        def guess(self, data, freq=None, **kwargs):
+            params = self.make_params()
+
+            def pset(param, value):
+                params['{}{}'.format(self.prefix, param)].set(value=value)
+            pset("ampl", np.max(data) - np.min(data))
+            pset("offset", np.mean(data) + 0.01)
+            if freq is None:
+                pset("freq", 1)
+            else:
+                pset("freq", freq)
+            pset("x0", 0)
+            return lmfit.models.update_param_vals(params, self.prefix, **kwargs)
+    name_dict = {'sine': MySineModel()}
+    return name_dict.get(name)
