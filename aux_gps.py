@@ -19,6 +19,10 @@ from PW_paths import work_yuval
 #     better = better.reset_index(drop=True)
 #     better.index = np.arange(-days_prior, days_after, 1/pts_per_day)
 
+month_to_doy_dict = {1: 1, 2: 32, 3: 61, 4: 92, 5: 122,
+                     6: 153, 7: 183, 8: 214, 9: 245, 10: 275, 11: 306, 12: 336}
+
+
 def replace_xarray_time_series_with_its_group(da, grp='month', time_dim='time'):
     """run the same func on each dim in da"""
     import xarray as xr
@@ -1332,13 +1336,18 @@ def consecutive_runs(arr, num=False):
     return A
 
 
-def get_all_possible_combinations_from_list(li, reduce_single_list=True):
+def get_all_possible_combinations_from_list(li, reduce_single_list=True, combine_by_sep='+'):
     from itertools import combinations
     output = sum([list(map(list, combinations(li, i)))
                   for i in range(len(li) + 1)], [])
     output = output[1:]
     if reduce_single_list:
         output = [x[0] if len(x) == 1 else x for x in output]
+        if combine_by_sep is not None:
+            for out in output:
+                if isinstance(out, list):
+                    ind = output.index(out)
+                    output[ind] = '+'.join(out)
     return output
 
 
@@ -3338,3 +3347,30 @@ def pick_lmfit_model(name='sine'):
             return lmfit.models.update_param_vals(params, self.prefix, **kwargs)
     name_dict = {'sine': MySineModel()}
     return name_dict.get(name)
+
+
+def move_or_copy_files_from_doy_dir_structure_to_single_path(yearly_path=work_yuval/'SST',
+                                                             movepath=work_yuval/'SST',
+                                                             filetype='*.nc',
+                                                             opr='copy'):
+    """move files from year-doy directory structure to another path."""
+    from aux_gps import path_glob
+    import shutil
+    year_dirs = sorted([x for x in path_glob(yearly_path, '*/') if x.is_dir()])
+    years = []
+    for year_dir in year_dirs:
+        print('year {} is being processed.'.format(year_dir))
+        years.append(year_dir.as_posix().split('/')[-1])
+        doy_dirs = sorted([x for x in path_glob(year_dir, '*/') if x.is_dir()])
+        for doy_dir in doy_dirs:
+            file = path_glob(doy_dir, filetype)[0]
+            same_file = file.as_posix().split('/')[-1]
+            orig = file
+            dest = movepath / same_file
+            if opr == 'copy':
+                shutil.copy(orig.resolve(), dest.resolve())
+            elif opr == 'move':
+                shutil.move(orig.resolve(), dest.resolve())
+            print('{} has been {}ed {}'.format(same_file, opr, movepath))
+    return years
+

@@ -20,7 +20,7 @@ hydro_pw_dict = {'nizn': 25191, 'klhv': 21105, 'yrcm': 55165,
 
 hydro_st_name_dict = {25191: 'Lavan - new nizana road',
                       21105: 'Shikma - Tel milcha',
-                      55165: 'Mamasheet',
+                      55165: 'Mamsheet',
                       56140: 'Ramon',
                       48125: 'Draga',
                       48192: 'Chiemar - down the cliff',
@@ -47,7 +47,12 @@ hydro_st_name_dict = {25191: 'Lavan - new nizana road',
 # the model in 24 hours ? only on SVC and MLP ?
 # implemetn TSS and HSS scores and test them (make_scorer from confusion matrix)
 # redo results but with inner and outer splits of 4, 4
-
+# plot and see best_score per refit-scorrer - this is the best score of GridSearchCV on the entire
+# train/validation subset per each outerfold - basically see if the test_metric increased after the gridsearchcv as it should
+# use holdout set
+# implement repeatedstratifiedkfold and run it...
+# check for stability of the gridsearch CV...also run with 4-folds ?
+# finalize the permutation_importances and permutation_test_scores
 
 def prepare_tide_events_GNSS_dataset(hydro_path=hydro_path):
     import xarray as xr
@@ -82,7 +87,7 @@ def select_features_from_X(X, features='pwv'):
     return X
 
 
-def combine_pos_neg_from_nc_file(hydro_path=hydro_path, seed=1):
+def combine_pos_neg_from_nc_file(hydro_path=hydro_path, all_neg=False, seed=1):
     from aux_gps import path_glob
     import xarray as xr
     import numpy as np
@@ -97,15 +102,33 @@ def combine_pos_neg_from_nc_file(hydro_path=hydro_path, seed=1):
     y_pos['sample'] = X_pos['sample']
     # choose at random y_pos size of negative class:
     X_neg = ds['X_neg'].rename({'negative_sample': 'sample'})
-    dts = np.random.choice(
-        X_neg['sample'], y_pos['sample'].size, replace=False)
-    X_neg = X_neg.sel(sample=dts)
+    if not all_neg:
+        dts = np.random.choice(
+            X_neg['sample'], y_pos['sample'].size, replace=False)
+        X_neg = X_neg.sel(sample=dts)
     y_neg = xr.DataArray(np.zeros(X_neg['sample'].shape), dims=['sample'])
     y_neg['sample'] = X_neg['sample']
     # now concat all X's and y's:
     X = xr.concat([X_pos, X_neg], 'sample')
     y = xr.concat([y_pos, y_neg], 'sample')
+    X.name = 'X'
     return X, y
+
+
+def drop_hours_in_pwv_pressure_features(X, last_hours=7, verbose=True):
+    import numpy as np
+    Xcopy = X.copy()
+    pwvs_to_drop = ['pwv_{}'.format(x) for x in np.arange(24-last_hours + 1, 25)]
+    if set(pwvs_to_drop).issubset(set(X.feature.values)):
+        if verbose:
+            print('dropping {} from X.'.format(', '.join(pwvs_to_drop)))
+        Xcopy = Xcopy.drop_sel(feature=pwvs_to_drop)
+    pressures_to_drop = ['pressure_{}'.format(x) for x in np.arange(24-last_hours + 1, 25)]
+    if set(pressures_to_drop).issubset(set(X.feature.values)):
+        if verbose:
+            print('dropping {} from X.'.format(', '.join(pressures_to_drop)))
+        Xcopy = Xcopy.drop_sel(feature=pressures_to_drop)
+    return Xcopy
 
 
 def check_if_negatives_are_within_positives(neg_da, hydro_path=hydro_path):
@@ -564,12 +587,13 @@ def permutation_scikit(X, y, cv=False, plot=True):
                   decision_function_shape='ovr', degree=3, gamma=0.032374575428176434,
                   kernel='poly', max_iter=-1, probability=False, random_state=None,
                   shrinking=True, tol=0.001, verbose=False)
+        clf = SVC(kernel='linear')
 #        clf = LinearDiscriminantAnalysis()
-        # cv = StratifiedKFold(2, shuffle=True)
-        cv = KFold(4, shuffle=True)
+        cv = StratifiedKFold(4, shuffle=True)
+        # cv = KFold(4, shuffle=True)
         n_classes = 2
         score, permutation_scores, pvalue = permutation_test_score(
-            clf, X, y, scoring="f1", cv=cv, n_permutations=1000, n_jobs=1)
+            clf, X, y, scoring="f1", cv=cv, n_permutations=1000, n_jobs=-1, verbose=2)
 
         print("Classification score %s (pvalue : %s)" % (score, pvalue))
         plt.hist(permutation_scores, 20, label='Permutation scores',
@@ -682,6 +706,195 @@ def produce_ROC_curves_from_model(model, X, y, cv, kfold_name='inner_kfold'):
     return ds
 
 
+def cross_validation_with_holdout(X, y, model_name='SVC', features='pwv',
+                                  n_splits=3, test_ratio=0.25,
+                                  scorers=['f1', 'recall', 'tss', 'hss',
+                                           'precision', 'accuracy'],
+                                  seed=42, savepath=None, verbose=0,
+                                  param_grid='normal', n_jobs=-1,
+                                  n_repeats=None):
+    # from sklearn.model_selection import cross_validate
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import RepeatedStratifiedKFold
+    from sklearn.model_selection import GridSearchCV
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import make_scorer
+    # from string import digits
+    import numpy as np
+    # import xarray as xr
+    scores_dict = {s: s for s in scorers}
+    if 'tss' in scorers:
+        scores_dict['tss'] = make_scorer(tss_score)
+    if 'hss' in scorers:
+        scores_dict['hss'] = make_scorer(hss_score)
+
+    X = select_doy_from_feature_list(X, model_name, features)
+    if param_grid == 'light':
+        print(np.unique(X.feature.values))
+    # first take out the hold-out set:
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=test_ratio,
+                                                        random_state=seed,
+                                                        stratify=y)
+    if n_repeats is None:
+        # configure the cross-validation procedure
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True,
+                             random_state=seed)
+        print('CV StratifiedKfolds of {}.'.format(n_splits))
+        # define the model and search space:
+    else:
+        cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats,
+                                     random_state=seed)
+        print('CV RepeatedStratifiedKFold of {} with {} repeats.'.format(n_splits, n_repeats))
+    ml = ML_Classifier_Switcher()
+    print('param grid group is set to {}.'.format(param_grid))
+    sk_model = ml.pick_model(model_name, pgrid=param_grid)
+    search_space = ml.param_grid
+    # define search
+    gr_search = GridSearchCV(estimator=sk_model, param_grid=search_space,
+                             cv=cv, n_jobs=n_jobs,
+                             scoring=scores_dict,
+                             verbose=verbose,
+                             refit=False, return_train_score=True)
+
+    gr_search.fit(X, y)
+    if isinstance(features, str):
+        features = [features]
+    if savepath is not None:
+        filename = 'GRSRCHCV_holdout_{}_{}_{}_{}_{}_{}_{}.pkl'.format(
+            model_name, '+'.join(features), '+'.join(scorers), n_splits,
+            int(test_ratio*100), param_grid, seed)
+        save_gridsearchcv_object(gr_search, savepath, filename)
+    # gr, _ = process_gridsearch_results(
+    #         gr_search, model_name, split_dim='kfold', features=X.feature.values)
+    # remove_digits = str.maketrans('', '', digits)
+    # features = list(set([x.translate(remove_digits).split('_')[0]
+    #                      for x in X.feature.values]))
+    # # add more attrs, features etc:
+    # gr.attrs['features'] = features
+
+    return gr_search
+
+
+def select_doy_from_feature_list(X, model_name='RF', features='pwv'):
+        # first if RF chosen, replace the cyclic coords of DOY (sin and cos) with
+    # the DOY itself.
+    if isinstance(features, list):
+        feats = features.copy()
+    else:
+        feats = features
+    if model_name == 'RF' and 'doy' in features:
+        if isinstance(features, list):
+            feats.remove('doy')
+            feats.append('DOY')
+        elif isinstance(features, str):
+            feats = 'DOY'
+    elif model_name != 'RF' and 'doy' in features:
+        if isinstance(features, list):
+            feats.remove('doy')
+            feats.append('doy_sin')
+            feats.append('doy_cos')
+        elif isinstance(features, str):
+            feats = ['doy_sin']
+            feats.append('doy_cos')
+    X = select_features_from_X(X, feats)
+    return X
+
+
+def single_cross_validation(X_val, y_val, model_name='SVC', features='pwv',
+                            n_splits=4, scorers=['f1', 'recall', 'tss', 'hss',
+                                                 'precision', 'accuracy'],
+                            seed=42, savepath=None, verbose=0,
+                            param_grid='normal', n_jobs=-1,
+                            n_repeats=None, outer_split='1-1'):
+    # from sklearn.model_selection import cross_validate
+    from sklearn.model_selection import StratifiedKFold
+    from sklearn.model_selection import RepeatedStratifiedKFold
+    from sklearn.model_selection import GridSearchCV
+    # from sklearn.model_selection import train_test_split
+    from sklearn.metrics import make_scorer
+    # from string import digits
+    import numpy as np
+    # import xarray as xr
+    scores_dict = {s: s for s in scorers}
+    if 'tss' in scorers:
+        scores_dict['tss'] = make_scorer(tss_score)
+    if 'hss' in scorers:
+        scores_dict['hss'] = make_scorer(hss_score)
+
+    X = select_doy_from_feature_list(X_val, model_name, features)
+    y = y_val
+
+    if param_grid == 'light':
+        print(np.unique(X.feature.values))
+
+    if n_repeats is None:
+        # configure the cross-validation procedure
+        cv = StratifiedKFold(n_splits=n_splits, shuffle=True,
+                             random_state=seed)
+        print('CV StratifiedKfolds of {}.'.format(n_splits))
+        # define the model and search space:
+    else:
+        cv = RepeatedStratifiedKFold(n_splits=n_splits, n_repeats=n_repeats,
+                                     random_state=seed)
+        print('CV RepeatedStratifiedKFold of {} with {} repeats.'.format(
+            n_splits, n_repeats))
+    ml = ML_Classifier_Switcher()
+    print('param grid group is set to {}.'.format(param_grid))
+    if outer_split == '1-1':
+        cv_type = 'holdout'
+        print('holdout cv is selected.')
+    else:
+        cv_type = 'nested'
+        print('nested cv {} out of {}.'.format(
+            outer_split.split('-')[0], outer_split.split('-')[1]))
+    sk_model = ml.pick_model(model_name, pgrid=param_grid)
+    search_space = ml.param_grid
+    # define search
+    gr_search = GridSearchCV(estimator=sk_model, param_grid=search_space,
+                             cv=cv, n_jobs=n_jobs,
+                             scoring=scores_dict,
+                             verbose=verbose,
+                             refit=False, return_train_score=True)
+
+    gr_search.fit(X, y)
+    if isinstance(features, str):
+        features = [features]
+    if savepath is not None:
+        filename = 'GRSRCHCV_{}_{}_{}_{}_{}_{}_{}_{}.pkl'.format(cv_type,
+                                                                 model_name, '+'.join(features), '+'.join(
+                                                                     scorers), n_splits,
+                                                                 outer_split, param_grid, seed)
+        save_gridsearchcv_object(gr_search, savepath, filename)
+    return gr_search
+
+
+def save_cv_params_to_file(cv_obj, path, name):
+    import pandas as pd
+    di = vars(cv_obj)
+    splitter_type = cv_obj.__repr__().split('(')[0]
+    di['splitter_type'] = splitter_type
+    (pd.DataFrame.from_dict(data=di, orient='index')
+     .to_csv(path / '{}.csv'.format(name), header=False))
+    print('{}.csv saved to {}.'.format(name, path))
+    return
+
+
+def read_cv_params_and_instantiate(filepath):
+    import pandas as pd
+    from sklearn.model_selection import StratifiedKFold
+    df = pd.read_csv(filepath, header=None, index_col=0)
+    d = {}
+    for row in df.iterrows():
+        dd = pd.to_numeric(row[1], errors='ignore')
+        if dd.item() == 'True' or dd.item() == 'False':
+            dd = dd.astype(bool)
+        d[dd.to_frame().columns.item()] = dd.item()
+    s_type = d.pop('splitter_type')
+    if s_type == 'StratifiedKFold':
+        cv = StratifiedKFold(**d)
+    return cv
+
+
 def nested_cross_validation_procedure(X, y, model_name='SVC', features='pwv',
                                       outer_splits=4, inner_splits=2,
                                       refit_scorer='roc_auc',
@@ -689,7 +902,7 @@ def nested_cross_validation_procedure(X, y, model_name='SVC', features='pwv',
                                                'roc_auc', 'precision',
                                                'accuracy'],
                                       seed=42, savepath=None, verbose=0,
-                                      diagnostic=False, n_jobs=-1):
+                                      param_grid='normal', n_jobs=-1):
     from sklearn.model_selection import cross_validate
     from sklearn.model_selection import StratifiedKFold
     from sklearn.model_selection import GridSearchCV
@@ -706,23 +919,7 @@ def nested_cross_validation_procedure(X, y, model_name='SVC', features='pwv',
     if 'hss' in scorers:
         scores_dict['hss'] = make_scorer(hss_score)
 
-    # first if RF chosen, replace the cyclic coords of DOY (sin and cos) with
-    # the DOY itself.
-    if model_name == 'RF' and 'doy' in features:
-        if isinstance(features, list):
-            features.remove('doy')
-            features.append('DOY')
-        elif isinstance(features, str):
-            features = 'DOY'
-    elif model_name != 'RF' and 'doy' in features:
-        if isinstance(features, list):
-            features.remove('doy')
-            features.append('doy_sin')
-            features.append('doy_cos')
-        elif isinstance(features, str):
-            features = ['doy_sin']
-            features.append('doy_cos')
-    X = select_features_from_X(X, features)
+    X = select_doy_from_feature_list(X, model_name, features)
     # if model_name == 'RF':
     #     doy = X['sample'].dt.dayofyear
     #     sel_doy = [x for x in X.feature.values if 'doy_sin' in x]
@@ -743,7 +940,7 @@ def nested_cross_validation_procedure(X, y, model_name='SVC', features='pwv',
     #         for f in features:
     #             fs += [x for x in X.feature.values if f in x]
     #         X = X.sel(feature=fs)
-    if diagnostic:
+    if param_grid == 'light':
         print(np.unique(X.feature.values))
     # configure the cross-validation procedure
     cv_inner = StratifiedKFold(n_splits=inner_splits, shuffle=True,
@@ -751,11 +948,9 @@ def nested_cross_validation_procedure(X, y, model_name='SVC', features='pwv',
     print('Inner CV StratifiedKfolds of {}.'.format(inner_splits))
     # define the model and search space:
     ml = ML_Classifier_Switcher()
-    light = False
-    if diagnostic:
-        print('disgnostic mode.')
-        light = True
-    sk_model = ml.pick_model(model_name, light=light)
+    if param_grid == 'light':
+        print('disgnostic mode light.')
+    sk_model = ml.pick_model(model_name, pgrid=param_grid)
     search_space = ml.param_grid
     # define search
     gr_search = GridSearchCV(estimator=sk_model, param_grid=search_space,
@@ -862,28 +1057,193 @@ def nested_cross_validation_procedure(X, y, model_name='SVC', features='pwv',
 #         return model
 
 
+def plot_hyper_parameters_heatmaps_from_nested_CV_model(path=hydro_path, model_name='MLP',
+                                                        features='pwv+pressure+doy', save=True):
+    import xarray as xr
+    import matplotlib.pyplot as plt
+    ds = xr.load_dataset(
+        path / 'nested_CV_test_results_{}_all_features_with_hyper.nc'.format(model_name))
+    ds = ds.sel(features=features).reset_coords(drop=True)
+    non_hp_vars = ['mean_score', 'std_score',
+                   'test_score', 'roc_auc_score', 'TPR']
+    if model_name == 'RF':
+        non_hp_vars.append('feature_importances')
+    ds = ds[[x for x in ds if x not in non_hp_vars]]
+    seq = 'Blues'
+    cat = 'Dark2'
+    cmap_hp_dict = {
+        'alpha': seq, 'activation': cat,
+        'hidden_layer_sizes': cat, 'learning_rate': cat,
+        'solver': cat, 'kernel': cat, 'C': seq,
+        'gamma': seq, 'degree': seq, 'coef0': seq,
+        'max_depth': seq, 'max_features': cat,
+        'min_samples_leaf': seq, 'min_samples_split': seq,
+        'n_estimators': seq
+    }
+    # fix stuff for SVC:
+    if model_name == 'SVC':
+        ds['degree'] = ds['degree'].where(ds['kernel']=='poly')
+        ds['coef0'] = ds['coef0'].where(ds['kernel']=='poly')
+    # da = ds.to_arrray('hyper_parameters')
+    # fg = xr.plot.FacetGrid(
+    #     da,
+    #     col='hyper_parameters',
+    #     sharex=False,
+    #     sharey=False, figsize=(16, 10))
+    fig, axes = plt.subplots(5, 1, sharex=True, figsize=(4, 10))
+    for i, da in enumerate(ds):
+        df = ds[da].reset_coords(drop=True).to_dataset('scorer').to_dataframe()
+        df.index.name = 'Outer Split'
+        cmap = cmap_hp_dict.get(da, 'Set1')
+        plot_heatmap_for_hyper_parameters_df(df, ax=axes[i], title=da, cmap=cmap)
+    fig.tight_layout()
+    if save:
+        filename = 'Hyper-parameters_nested_{}.png'.format(
+            model_name)
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
+    return
+
+
+def plot_heatmap_for_hyper_parameters_df(df, ax=None, cmap='colorblind',
+                                         title=None, fontsize=12):
+    import pandas as pd
+    import seaborn as sns
+    import numpy as np
+    sns.set_style('ticks')
+    sns.set_style('whitegrid')
+    sns.set(font_scale=1.2)
+    value_to_int = {j: i for i, j in enumerate(
+        sorted(pd.unique(df.values.ravel())))} # like you did
+    # for key in value_to_int.copy().keys():
+    #     try:
+    #         if np.isnan(key):
+    #             value_to_int['NA'] = value_to_int.pop(key)
+    #             df = df.fillna('NA')
+    #     except TypeError:
+    #         pass
+    try:
+        sorted_v_to_i = dict(sorted(value_to_int.items()))
+    except TypeError:
+        sorted_v_to_i = value_to_int
+    n = len(value_to_int)
+    # discrete colormap (n samples from a given cmap)
+    cmap = sns.color_palette(cmap, n)
+    if ax is None:
+        ax = sns.heatmap(df.replace(sorted_v_to_i), cmap=cmap,
+                         linewidth=1, linecolor='k', square=False,
+                         cbar_kws={"shrink": .9})
+    else:
+        ax = sns.heatmap(df.replace(sorted_v_to_i), cmap=cmap,
+                         ax=ax, linewidth=1, linecolor='k',
+                         square=False, cbar_kws={"shrink": .9})
+    if title is not None:
+        ax.set_title(title, fontsize=fontsize)
+    ax.set_xticklabels(ax.get_xticklabels(), rotation=30)
+    ax.set_yticklabels(ax.get_yticklabels(), rotation=0)
+    ax.tick_params(labelsize=fontsize)
+    ax.set_ylabel(ax.get_ylabel(), fontsize=fontsize)
+    ax.set_xlabel(ax.get_xlabel(), fontsize=fontsize)
+    colorbar = ax.collections[0].colorbar
+    r = colorbar.vmax - colorbar.vmin
+    colorbar.set_ticks([colorbar.vmin + r / n * (0.5 + i) for i in range(n)])
+    colorbar.set_ticklabels(list(value_to_int.keys()))
+    return ax
+
+
+def plot_ROC_curves_for_all_models_and_scorers(dss, save=False,
+                                               fontsize=24, fig_split=1,
+                                               feat=['pwv', 'pwv+pressure', 'pwv+pressure+doy']):
+    import xarray as xr
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    import pandas as pd
+    cmap = sns.color_palette('tab10', len(feat))
+    sns.set_style('whitegrid')
+    sns.set_style('ticks')
+    if fig_split == 1:
+        dss = dss.sel(scorer=['precision', 'recall', 'f1'])
+    elif fig_split == 2:
+        dss = dss.sel(scorer=['accuracy', 'tss', 'hss'])
+    fg = xr.plot.FacetGrid(
+        dss,
+        col='model',
+        row='scorer',
+        sharex=True,
+        sharey=True, figsize=(20, 20))
+    for i in range(fg.axes.shape[0]):  # i is rows
+        for j in range(fg.axes.shape[1]):  # j is cols
+            ax = fg.axes[i, j]
+            modelname = dss['model'].isel(model=j).item()
+            scorer = dss['scorer'].isel(scorer=i).item()
+            chance_plot = [False for x in feat]
+            chance_plot[-1] = True
+            for k, f in enumerate(feat):
+                #     name = '{}-{}-{}'.format(modelname, scoring, feat)
+                # model = dss.isel({'model': j, 'scoring': i}).sel(
+                #     {'features': feat})
+                model = dss.isel({'model': j, 'scorer': i}
+                                 ).sel({'features': f})
+                # return model
+                title = 'ROC of {} model ({})'.format(modelname.replace('SVC', 'SVM'), scorer)
+                try:
+                    ax = plot_ROC_curve_from_dss_nested_CV(model, outer_dim='outer_split',
+                                                           plot_chance=[k],
+                                                           main_label=f,
+                                                           ax=ax,
+                                                           color=cmap[k], title=title,
+                                                           fontsize=fontsize)
+                except ValueError:
+                    ax.grid('on')
+                    continue
+            handles, labels = ax.get_legend_handles_labels()
+            lh_ser = pd.Series(labels, index=handles).drop_duplicates()
+            lh_ser = lh_ser.sort_values(ascending=False)
+            hand = lh_ser.index.values
+            labe = lh_ser.values
+            ax.legend(handles=hand.tolist(), labels=labe.tolist(), loc="lower right",
+                      fontsize=fontsize-7)
+            ax.grid('on')
+            if j >= 1:
+                ax.set_ylabel('')
+            if fig_split == 1:
+                ax.set_xlabel('')
+                ax.tick_params(labelbottom=False)
+            else:
+                if i <= 1:
+                    ax.set_xlabel('')
+    # title = '{} station: {} total events'.format(
+    #         station.upper(), events)
+    # if max_flow > 0:
+    #     title = '{} station: {} total events (max flow = {} m^3/sec)'.format(
+    #         station.upper(), events, max_flow)
+    # fg.fig.suptitle(title, fontsize=fontsize)
+    fg.fig.tight_layout()
+    fg.fig.subplots_adjust(top=0.937,
+                           bottom=0.054,
+                           left=0.039,
+                           right=0.993,
+                           hspace=0.173,
+                           wspace=0.051)
+    if save:
+        filename = 'ROC_curves_nested_{}_figsplit_{}.png'.format(
+            dss['outer_split'].size, fig_split)
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
+    return fg
+
+
 def plot_hydro_ML_models_results_from_dss(dss, std_on='outer',
                                           save=False, fontsize=16,
-                                          plot_type='ROC', neg=1,
-                                          feat=['doy+pressure+pwv', 'pwv']):
+                                          plot_type='ROC', split=1,
+                                          feat=['pwv', 'pressure+pwv', 'doy+pressure+pwv']):
     import xarray as xr
     import seaborn as sns
     import matplotlib.pyplot as plt
     import pandas as pd
     cmap = sns.color_palette("colorblind", len(feat))
-    # dss = dss.sel(neg_pos_ratio=neg)
-    # if len(station) > 4:
-    #     max_flow = 0
-    #     sts = [x for x in station.split('-')]
-    #     hs_ids = [int(x) for x in dss.attrs['hs_id'].split('-')]
-    #     X, y = produce_X_y_from_list(
-    #         sts, hs_ids, neg_pos_ratio=1, concat_Xy=True)
-    # else:
-    #     max_flow = dss.attrs['max_flow']
-    #     X, y = produce_X_y(station, hydro_pw_dict[station], neg_pos_ratio=1,
-    #                        max_flow=max_flow)
-    # events = int(y[y == 1].sum().item())
-    # assert station == dss.attrs['pwv_id']
+    if split == 1:
+        dss = dss.sel(scoring=['f1', 'precision', 'recall'])
+    elif split == 2:
+        dss = dss.sel(scoring=['tss', 'hss', 'roc-auc', 'accuracy'])
     fg = xr.plot.FacetGrid(
         dss,
         col='model',
@@ -937,9 +1297,9 @@ def plot_hydro_ML_models_results_from_dss(dss, std_on='outer',
                            hspace=0.173,
                            wspace=0.051)
     if save:
-        filename = 'hydro_models_on_{}_{}_std_on_{}_{}_neg{}.png'.format(
+        filename = 'hydro_models_on_{}_{}_std_on_{}_{}.png'.format(
             dss['inner_kfold'].size, dss['outer_kfold'].size,
-            std_on, plot_type, neg)
+            std_on, plot_type)
         plt.savefig(savefig_path / filename, bbox_inches='tight')
     return fg
 
@@ -1028,26 +1388,29 @@ def order_features_list(flist):
     return new_flist
 
 
-def load_ML_run_results(path=hydro_ml_path, prefix='CVR', pw_station='drag'):
+def smart_add_dataarray_to_ds_list(dsl, da_name='feature_importances'):
+    """add data array to ds_list even if it does not exist, use shape of
+    data array that exists in other part of ds list"""
+    import numpy as np
+    import xarray as xr
+    # print(da_name)
+    fi = [x for x in dsl if da_name in x][0]
+    print(da_name, fi[da_name].shape)
+    fi = fi[da_name].copy(data=np.zeros(shape=fi[da_name].shape))
+    new_dsl = []
+    for ds in dsl:
+        if da_name not in ds:
+            ds = xr.merge([ds, fi], combine_attrs='no_conflicts')
+        new_dsl.append(ds)
+    return new_dsl
+
+def load_ML_run_results(path=hydro_ml_path, prefix='CVR',
+                        change_DOY_to_doy=True):
     from aux_gps import path_glob
     import xarray as xr
 #    from aux_gps import save_ncfile
     import pandas as pd
     import numpy as np
-
-    def smart_add_dataarray_to_ds_list(dsl, da_name='feature_importances'):
-        """add data array to ds_list even if it does not exist, use shape of
-        data array that exists in other part of ds list"""
-        # print(da_name)
-        fi = [x for x in dsl if da_name in x][0]
-        print(da_name, fi[da_name].shape)
-        fi = fi[da_name].copy(data=np.zeros(shape=fi[da_name].shape))
-        new_dsl = []
-        for ds in dsl:
-            if da_name not in ds:
-                ds = xr.merge([ds, fi], combine_attrs='no_conflicts')
-            new_dsl.append(ds)
-        return new_dsl
 
     print('loading hydro ML results for all models and features')
     # print('loading hydro ML results for station {}'.format(pw_station))
@@ -1055,21 +1418,20 @@ def load_ML_run_results(path=hydro_ml_path, prefix='CVR', pw_station='drag'):
     model_files = sorted(model_files)
     # model_files = [x for x in model_files if pw_station in x.as_posix()]
     ds_list = [xr.load_dataset(x) for x in model_files]
+    if change_DOY_to_doy:
+        for ds in ds_list:
+            if 'DOY' in ds.features:
+                new_feats = [x.replace('DOY', 'doy') for x in ds['feature'].values]
+                ds['feature'] = new_feats
+                ds.attrs['features'] = [x.replace('DOY', 'doy') for x in ds.attrs['features']]
     model_as_str = [x.as_posix().split('/')[-1].split('.')[0]
                     for x in model_files]
     model_names = [x.split('_')[1] for x in model_as_str]
     model_scores = [x.split('_')[3] for x in model_as_str]
     model_features = [x.split('_')[2] for x in model_as_str]
+    if change_DOY_to_doy:
+        model_features = [x.replace('DOY', 'doy') for x in model_features]
     new_model_features = order_features_list(model_features)
-    # model_hs_id = [x.split('_')[2] for x in model_as_str]
-    # model_ratio = [int(x.split('_')[-1]) for x in model_as_str]
-    # assert len(set(model_hs_id)) == 1
-#    hs_id = list(set(model_hs_id))[0]
-    # tups = [
-    #     tuple(x) for x in zip(
-    #         model_names,
-    #         new_model_features,
-    #         model_scores)]
     ind = pd.MultiIndex.from_arrays(
         [model_names,
             new_model_features,
@@ -1107,6 +1469,158 @@ def load_ML_run_results(path=hydro_ml_path, prefix='CVR', pw_station='drag'):
     dss = calculate_metrics_from_ML_dss(dss)
     print('Done!')
     return dss
+
+
+def plot_nested_CV_test_scores(dss, feats='pwv+pressure+doy'):
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    def show_values_on_bars(axs, fs=12, fw='bold'):
+        import numpy as np
+        def _show_on_single_plot(ax):
+            for p in ax.patches:
+                _x = p.get_x() + p.get_width() / 2
+                _y = p.get_y() + p.get_height()
+                value = '{:.2f}'.format(p.get_height())
+                ax.text(_x, _y, value, ha="center",
+                        fontsize=fs, fontweight=fw, zorder=20)
+
+        if isinstance(axs, np.ndarray):
+            for idx, ax in np.ndenumerate(axs):
+                _show_on_single_plot(ax)
+        else:
+            _show_on_single_plot(axs)
+    if feats is None:
+        feats = ['pwv', 'pwv+pressure', 'pwv+pressure+doy']
+    dst = dss.sel(features=feats)  # .reset_coords(drop=True)
+    df = dst['test_score'].to_dataframe()
+    df['scorer'] = df.index.droplevel(2).droplevel(1).droplevel(0)
+    df['model'] = df.index.droplevel(3).droplevel(2).droplevel(1)
+    df['features'] = df.index.droplevel(2).droplevel(2).droplevel(0)
+    df['outer_splits'] = df.index.droplevel(0).droplevel(2).droplevel(0)
+    df['model'] = df['model'].str.replace('SVC', 'SVM')
+    df = df.melt(value_vars='test_score', id_vars=[
+        'features', 'model', 'scorer', 'outer_splits'], var_name='test_score',
+        value_name='score')
+    sns.set(font_scale=1.5)
+    sns.set_style('whitegrid')
+    sns.set_style('ticks')
+    g = sns.catplot(x="model", y="score", hue='features',
+                    col="scorer", ci='sd', row=None,
+                    col_wrap=3,
+                    data=df, kind="bar", capsize=0.25,
+                    height=4, aspect=1.5, errwidth=1.5)
+    g.set_xticklabels(rotation=45)
+    [x.grid(True) for x in g.axes.flatten()]
+    show_values_on_bars(g.axes)
+    filename = 'ML_scores_models_nested_CV_{}.png'.format('_'.join(feats))
+    plt.savefig(savefig_path / filename, bbox_inches='tight')
+    return df
+
+
+def plot_holdout_test_scores(dss, feats='pwv+pressure+doy'):
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+
+    def show_values_on_bars(axs, fs=12, fw='bold'):
+        import numpy as np
+
+        def _show_on_single_plot(ax):
+            for p in ax.patches:
+                _x = p.get_x() + p.get_width() / 2
+                _y = p.get_y() + p.get_height()
+                value = '{:.2f}'.format(p.get_height())
+                ax.text(_x, _y, value, ha="center", fontsize=fs, fontweight=fw)
+
+        if isinstance(axs, np.ndarray):
+            for idx, ax in np.ndenumerate(axs):
+                _show_on_single_plot(ax)
+        else:
+            _show_on_single_plot(axs)
+    if feats is None:
+        feats = ['pwv', 'pwv+pressure', 'pwv+pressure+doy']
+    dst = dss.sel(features=feats)  # .reset_coords(drop=True)
+    df = dst['holdout_test_scores'].to_dataframe()
+    df['scorer'] = df.index.droplevel(1).droplevel(0)
+    df['model'] = df.index.droplevel(2).droplevel(1)
+    df['features'] = df.index.droplevel(2).droplevel(0)
+    df['model'] = df['model'].str.replace('SVC', 'SVM')
+    df = df.melt(value_vars='holdout_test_scores', id_vars=[
+        'features', 'model', 'scorer'], var_name='test_score')
+    sns.set(font_scale=1.5)
+    sns.set_style('whitegrid')
+    sns.set_style('ticks')
+    g = sns.catplot(x="model", y="value", hue='features',
+                    col="scorer", ci='sd', row=None,
+                    col_wrap=3,
+                    data=df, kind="bar", capsize=0.15,
+                    height=4, aspect=1.5, errwidth=0.8)
+    g.set_xticklabels(rotation=45)
+    [x.grid(True) for x in g.axes.flatten()]
+    show_values_on_bars(g.axes)
+    filename = 'ML_scores_models_holdout_{}.png'.format('_'.join(feats))
+    plt.savefig(savefig_path / filename, bbox_inches='tight')
+    return df
+
+
+def prepare_test_df_to_barplot_from_dss(dss, feats='doy+pwv+pressure',
+                                        plot=True, splitfigs=True):
+    import seaborn as sns
+    import matplotlib.pyplot as plt
+    dvars = [x for x in dss if 'test_' in x]
+    scores = [x.split('_')[-1] for x in dvars]
+    dst = dss[dvars]
+    # dst['scoring'] = [x+'_inner' for x in dst['scoring'].values]
+    # for i, ds in enumerate(dst):
+    #     dst[ds] = dst[ds].sel(scoring=scores[i]).reset_coords(drop=True)
+    if feats is None:
+        feats = ['pwv', 'pressure+pwv', 'doy+pressure+pwv']
+    dst = dst.sel(features=feats)  # .reset_coords(drop=True)
+    dst = dst.rename_vars(dict(zip(dvars, scores)))
+    # dst = dst.drop('scoring')
+    df = dst.to_dataframe()
+    # dfu = df
+    df['inner score'] = df.index.droplevel(2).droplevel(1).droplevel(0)
+    df['features'] = df.index.droplevel(2).droplevel(2).droplevel(1)
+    df['model'] = df.index.droplevel(2).droplevel(0).droplevel(1)
+    df = df.melt(value_vars=scores, id_vars=[
+        'features', 'model', 'inner score'], var_name='outer score')
+    # return dfu
+    # dfu.columns = dfu.columns.droplevel(1)
+    # dfu = dfu.T
+    # dfu['score'] = dfu.index
+    # dfu = dfu.reset_index()
+    # df = dfu.melt(value_vars=['MLP', 'RF', 'SVC'], id_vars=['score'])
+    df1 = df[(df['inner score']=='f1') | (df['inner score']=='precision') | (df['inner score']=='recall')]
+    df2 = df[(df['inner score']=='hss') | (df['inner score']=='tss') | (df['inner score']=='roc-auc') | (df['inner score']=='accuracy')]
+    if plot:
+        sns.set(font_scale = 1.5)
+        sns.set_style('whitegrid')
+        sns.set_style('ticks')
+        if splitfigs:
+            g = sns.catplot(x="outer score", y="value", hue='features',
+                            col="inner score", ci='sd',row='model',
+                            data=df1, kind="bar", capsize=0.15,
+                            height=4, aspect=1.5,errwidth=0.8)
+            g.set_xticklabels(rotation=45)
+            filename = 'ML_scores_models_{}_1.png'.format('_'.join(feats))
+            plt.savefig(savefig_path / filename, bbox_inches='tight')
+            g = sns.catplot(x="outer score", y="value", hue='features',
+                            col="inner score", ci='sd',row='model',
+                            data=df2, kind="bar", capsize=0.15,
+                            height=4, aspect=1.5,errwidth=0.8)
+            g.set_xticklabels(rotation=45)
+            filename = 'ML_scores_models_{}_2.png'.format('_'.join(feats))
+            plt.savefig(savefig_path / filename, bbox_inches='tight')
+        else:
+            g = sns.catplot(x="outer score", y="value", hue='features',
+                            col="inner score", ci='sd',row='model',
+                            data=df, kind="bar", capsize=0.15,
+                            height=4, aspect=1.5,errwidth=0.8)
+            g.set_xticklabels(rotation=45)
+            filename = 'ML_scores_models_{}.png'.format('_'.join(feats))
+            plt.savefig(savefig_path / filename, bbox_inches='tight')
+    return df
 
 
 def calculate_metrics_from_ML_dss(dss):
@@ -1267,7 +1781,9 @@ def calculate_metrics_from_ML_dss(dss):
 #        except IndexError:
 #            model_test_sizes.append(20)
 ##    model_pwv_hs_id = list(zip(model_pw_stations, model_hydro_stations))
-##    model_pwv_hs_id = ['_'.join(x) for x in model_pwv_hs_id]
+##    model_pwv_hs_id = ['_'.join(x) for     filename = 'CVR_{}_{}_{}_{}_{}.nc'.format(
+#         name, features, refitted_scorer, ikfolds, okfolds)
+# x in model_pwv_hs_id]
 #    # transform model_dict to dataarray:
 #    tups = [tuple(x) for x in zip(model_names, model_scores, model_nsplits, model_features, model_test_sizes)] #, model_pwv_hs_id)]
 #    ind = pd.MultiIndex.from_tuples((tups), names=['model', 'scoring', 'splits', 'feature', 'test_size']) #, 'station'])
@@ -1279,12 +1795,11 @@ def calculate_metrics_from_ML_dss(dss):
 #    return da
 
 
-def plot_heatmaps_for_all_models_and_scorings(dss, station='drag',
-                                              var='roc-auc'):  # , save=True):
+def plot_heatmaps_for_all_models_and_scorings(dss, var='roc-auc'):  # , save=True):
     import xarray as xr
     import seaborn as sns
     import matplotlib.pyplot as plt
-    assert station == dss.attrs['pwv_id']
+    # assert station == dss.attrs['pwv_id']
     cmaps = {'roc-auc': sns.color_palette("Blues", as_cmap=True),
              'pr-auc': sns.color_palette("Greens", as_cmap=True)}
     fg = xr.plot.FacetGrid(
@@ -1319,8 +1834,8 @@ def plot_heatmaps_for_all_models_and_scorings(dss, station='drag',
                 ax.set_xlabel('')
     cax = fg.fig.add_axes([0.1, 0.025, .8, .015])
     fg.fig.colorbar(ax.get_children()[0], cax=cax, orientation="horizontal")
-    fg.fig.suptitle('{}: {}'.format(
-        dss.attrs['pwv_id'].upper(), var.upper()), fontweight='bold')
+    fg.fig.suptitle('{}'.format(
+        dss.attrs[var].upper()), fontweight='bold')
     fg.fig.tight_layout()
     fg.fig.subplots_adjust(top=0.937,
                            bottom=0.099,
@@ -1335,14 +1850,87 @@ def plot_heatmaps_for_all_models_and_scorings(dss, station='drag',
     return fg
 
 
+def plot_feature_importances_from_dss(
+        dss,
+        feat_dim='features', outer_dim='outer_split',
+        features='pwv+pressure+doy', fix_xticklabels=True,
+        axes=None, save=True):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    import seaborn as sns
+    sns.set_palette('Dark2', 6)
+    sns.set_style('whitegrid')
+    sns.set_style('ticks')
+    # use dss.sel(model='RF') first as input
+    dss['feature'] = dss['feature'].str.replace('DOY', 'doy')
+    dss = dss.sel({feat_dim: features})
+    # tests_ds = dss['test_score']
+    # tests_ds = tests_ds.sel(scorer=scorer)
+    # max_score_split = int(tests_ds.idxmax(outer_dim).item())
+    # use mean outer split:
+    dss = dss.mean(outer_dim)
+    feats = features.split('+')
+    fn = len(feats)
+    if fn == 1:
+        gr_spec = None
+        fix_xticklabels = False
+    elif fn == 2:
+        gr_spec = [1, 1]
+    elif fn == 3:
+        gr_spec = [2, 5, 5]
+    if axes is None:
+        fig, axes = plt.subplots(1, fn, sharey=True, figsize=(17, 5), gridspec_kw={'width_ratios': gr_spec})
+        try:
+            axes.flatten()
+        except AttributeError:
+            axes = [axes]
+    for i, f in enumerate(sorted(feats)):
+        fe = [x for x in dss['feature'].values if f in x]
+        print(fe)
+        # dsf = dss['feature_importances'].sel(
+        #     feature=fe).sel({outer_dim: max_score_split}).reset_coords(
+        #     drop=True)
+        dsf = dss['feature_importances'].sel(
+            feature=fe).reset_coords(
+            drop=True)
+        dsf = dsf.to_dataset('scorer').to_dataframe(
+        ).reset_index(drop=True) * 100
+        title = '{}'.format(f.upper())
+        dsf.plot.bar(ax=axes[i], title=title, rot=0, legend=False, zorder=20,
+                     width=.8)
+        dsf_sum = dsf.sum().tolist()
+        handles, labels = axes[i].get_legend_handles_labels()
+        labels = [
+            '{} ({:.1f} %)'.format(
+                x, y) for x, y in zip(
+                labels, dsf_sum)]
+        axes[i].legend(handles=handles, labels=labels, prop={'size': 10}, loc='upper left')
+        axes[i].set_ylabel('Feature importance [%]')
+        axes[i].grid(axis='y', zorder=1)
+    if fix_xticklabels:
+        n = sum(['pwv' in x for x in dss.feature.values])
+        axes[0].xaxis.set_ticklabels('')
+        hrs = np.arange(-24, -24+n)
+        axes[1].set_xticklabels(hrs, rotation=30, ha="center", fontsize=12)
+        axes[2].set_xticklabels(hrs, rotation=30, ha="center", fontsize=12)
+        axes[1].set_xlabel('Hours prior to flood')
+        axes[2].set_xlabel('Hours prior to flood')
+        fig.tight_layout()
+    if save:
+        filename = 'RF_feature_importances_all_scorers_{}.png'.format(features)
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
+    return
+
+
 def plot_feature_importances(
         dss,
         feat_dim='features',
-        features='doy+pressure+pwv',
-        scoring='f1',
-        axes=None):
+        features='pwv+pressure+doy',
+        scoring='f1', fix_xticklabels=True,
+        axes=None, save=True):
     # use dss.sel(model='RF') first as input
     import matplotlib.pyplot as plt
+    import numpy as np
     dss = dss.sel({feat_dim: features})
     tests_ds = dss[[x for x in dss if 'test' in x]]
     tests_ds = tests_ds.sel(scoring=scoring)
@@ -1351,7 +1939,11 @@ def plot_feature_importances(
     feats = features.split('+')
     fn = len(feats)
     if axes is None:
-        fig, axes = plt.subplots(1, fn, sharey=True, figsize=(15, 20))
+        fig, axes = plt.subplots(1, fn, sharey=True, figsize=(17, 5), gridspec_kw={'width_ratios': [1, 4, 4]})
+        try:
+            axes.flatten()
+        except AttributeError:
+            axes = [axes]
     for i, f in enumerate(feats):
         fe = [x for x in dss['feature'].values if f in x]
         dsf = dss['feature_importances'].sel(
@@ -1361,41 +1953,143 @@ def plot_feature_importances(
         dsf = dsf.to_dataset('scoring').to_dataframe(
         ).reset_index(drop=True) * 100
         title = '{} ({})'.format(f.upper(), scoring)
-        dsf.plot.bar(ax=axes[i], title=title, rot=0, legend=False, zorder=20)
+        dsf.plot.bar(ax=axes[i], title=title, rot=0, legend=False, zorder=20,
+                     width=.8)
         dsf_sum = dsf.sum().tolist()
         handles, labels = axes[i].get_legend_handles_labels()
         labels = [
             '{} ({:.1f} %)'.format(
                 x, y) for x, y in zip(
                 labels, dsf_sum)]
-        axes[i].legend(handles=handles, labels=labels)
+        axes[i].legend(handles=handles, labels=labels, prop={'size': 8})
         axes[i].set_ylabel('Feature importance [%]')
         axes[i].grid(axis='y', zorder=1)
+    if fix_xticklabels:
+        axes[0].xaxis.set_ticklabels('')
+        hrs = np.arange(-24,0)
+        axes[1].set_xticklabels(hrs, rotation = 30, ha="center", fontsize=12)
+        axes[2].set_xticklabels(hrs, rotation = 30, ha="center", fontsize=12)
+        axes[1].set_xlabel('Hours prior to flood')
+        axes[2].set_xlabel('Hours prior to flood')
+    if save:
+        fig.tight_layout()
+        filename = 'RF_feature_importances_{}.png'.format(scoring)
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
     return
 
 
 def plot_feature_importances_for_all_scorings(dss,
-                                              features='doy+pressure+pwv',
-                                              model='RF'):
+                                              features='doy+pwv+pressure',
+                                              model='RF', splitfigs=True):
     import matplotlib.pyplot as plt
     # station = dss.attrs['pwv_id'].upper()
     dss = dss.sel(model=model).reset_coords(drop=True)
     fns = len(features.split('+'))
     scores = dss['scoring'].values
-    fig, axes = plt.subplots(len(scores), fns, sharey=True, figsize=(15, 20))
-    for i, score in enumerate(scores):
-        plot_feature_importances(
-            dss, features=features, scoring=score, axes=axes[i, :])
-    fig.suptitle(
-        'feature importances of {} model'.format(model))
-    fig.tight_layout()
-    fig.subplots_adjust(top=0.935,
-                        bottom=0.034,
-                        left=0.039,
-                        right=0.989,
-                        hspace=0.19,
-                        wspace=0.027)
+    scores1 = ['f1', 'precision', 'recall']
+    scores2 = ['hss', 'tss', 'accuracy','roc-auc']
+    if splitfigs:
+        fig, axes = plt.subplots(len(scores1), fns, sharey=True, figsize=(15, 20))
+        for i, score in enumerate(scores1):
+            plot_feature_importances(
+                dss, features=features, scoring=score, axes=axes[i, :])
+        fig.suptitle(
+            'feature importances of {} model'.format(model))
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.935,
+                            bottom=0.034,
+                            left=0.039,
+                            right=0.989,
+                            hspace=0.19,
+                            wspace=0.027)
+        filename = 'RF_feature_importances_1.png'
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
+        fig, axes = plt.subplots(len(scores2), fns, sharey=True, figsize=(15, 20))
+        for i, score in enumerate(scores2):
+            plot_feature_importances(
+                dss, features=features, scoring=score, axes=axes[i, :])
+        fig.suptitle(
+            'feature importances of {} model'.format(model))
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.935,
+                            bottom=0.034,
+                            left=0.039,
+                            right=0.989,
+                            hspace=0.19,
+                            wspace=0.027)
+        filename = 'RF_feature_importances_2.png'
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
+    else:
+        fig, axes = plt.subplots(len(scores), fns, sharey=True, figsize=(15, 20))
+        for i, score in enumerate(scores):
+            plot_feature_importances(
+                dss, features=features, scoring=score, axes=axes[i, :])
+        fig.suptitle(
+            'feature importances of {} model'.format(model))
+        fig.tight_layout()
+        fig.subplots_adjust(top=0.935,
+                            bottom=0.034,
+                            left=0.039,
+                            right=0.989,
+                            hspace=0.19,
+                            wspace=0.027)
+        filename = 'RF_feature_importances.png'
+        plt.savefig(savefig_path / filename, bbox_inches='tight')
     return dss
+
+
+def plot_ROC_curve_from_dss_nested_CV(dss, outer_dim='outer_split',
+                                      plot_chance=True, color='tab:blue',
+                                      fontsize=14, plot_legend=True,
+                                      title=None,
+                                      ax=None, main_label=None):
+    import matplotlib.pyplot as plt
+    import numpy as np
+    if ax is None:
+        fig, ax = plt.subplots()
+    if title is None:
+        title = "Receiver operating characteristic"
+    mean_fpr = dss['FPR'].values
+    mean_tpr = dss['TPR'].mean(outer_dim).values
+    mean_auc = dss['roc_auc_score'].mean().item()
+    if np.isnan(mean_auc):
+        return ValueError
+    std_auc = dss['roc_auc_score'].std().item()
+    field = 'TPR'
+    xlabel = 'False Positive Rate'
+    ylabel = 'True Positive Rate'
+    if main_label is None:
+        main_label = r'Mean ROC (AUC={:.2f}$\pm${:.2f})'.format(mean_auc, std_auc)
+    textstr = '\n'.join(['{}'.format(
+            main_label), r'(AUC={:.2f}$\pm${:.2f})'.format(mean_auc, std_auc)])
+    main_label = textstr
+    ax.plot(mean_fpr, mean_tpr, color=color,
+            lw=3, alpha=.8, label=main_label)
+    std_tpr = dss[field].std(outer_dim).values
+    n = dss[outer_dim].size
+    tprs_upper = np.minimum(mean_tpr + std_tpr, 1)
+    tprs_lower = np.maximum(mean_tpr - std_tpr, 0)
+    # plot Chance line:
+    if plot_chance:
+        ax.plot([0, 1], [0, 1], linestyle='--', lw=2, color='r',
+                label='Chance', alpha=.8, zorder=206)
+    stdlabel = r'$\pm$ 1 Std. dev.'
+    stdstr = '\n'.join(['{}'.format(stdlabel), r'({} outer splits)'.format(n)])
+    ax.fill_between(
+        mean_fpr,
+        tprs_lower,
+        tprs_upper,
+        color='grey',
+        alpha=.2, label=stdstr)
+    ax.grid()
+    ax.set(xlim=[-0.05, 1.05], ylim=[-0.05, 1.05])
+    # ax.set_title(title, fontsize=fontsize)
+    ax.tick_params(axis='y', labelsize=fontsize)
+    ax.tick_params(axis='x', labelsize=fontsize)
+    ax.set_xlabel(xlabel, fontsize=fontsize)
+    ax.set_ylabel(ylabel, fontsize=fontsize)
+    ax.set_title(title, fontsize=fontsize)
+    return ax
 
 
 def plot_ROC_PR_curve_from_dss(
@@ -1592,15 +2286,494 @@ def HP_tuning(X, y, model_name='SVC', val_size=0.18, n_splits=None,
     return ds, best_model
 
 
+def save_gridsearchcv_object(GridSearchCV, savepath, filename):
+    import joblib
+    print('{} was saved to {}'.format(filename, savepath))
+    joblib.dump(GridSearchCV, savepath / filename)
+    return
+
+
+def run_RF_feature_importance_on_all_features(path=hydro_path, gr_path=hydro_ml_path/'holdout'):
+    import xarray as xr
+    from aux_gps import get_all_possible_combinations_from_list
+    feats = get_all_possible_combinations_from_list(
+        ['pwv', 'pressure', 'doy'], reduce_single_list=True, combine_by_sep='+')
+    feat_list = []
+    for feat in feats:
+        da = holdout_test(model_name='RF', return_RF_FI=True, features=feat)
+        feat_list.append(da)
+    daa = xr.concat(feat_list, 'features')
+    daa['features'] = feats
+    return daa
+
+
+def load_nested_CV_test_results_from_all_models(path=hydro_path, load_hyper=False):
+    from aux_gps import path_glob
+    import xarray as xr
+    files = path_glob(path, 'nested_CV_test_results_*_all_features_with_hyper.nc')
+    models = [x.as_posix().split('/')[-1].split('_')[4] for x in files]
+    if not load_hyper:
+        print('loading CV test results only for {} models'.format(', '.join(models)))
+        dsl = [xr.load_dataset(x) for x in files]
+        dsl = [x[['mean_score', 'std_score', 'test_score', 'roc_auc_score', 'TPR']] for x in dsl]
+        dss = xr.concat(dsl, 'model')
+        dss['model'] = models
+    return dss
+
+
+def run_CV_nested_tests_on_all_features(path=hydro_path, gr_path=hydro_ml_path/'nested4',
+                                        verbose=False, model_name='SVC',
+                                        savepath=None, drop_hours=None, PI=30, Ptest=None):
+    """returns the nested CV test results for all scorers, features and models,
+    if model is chosen, i.e., model='MLP', returns just this model results
+    and its hyper-parameters per each outer split"""
+    import xarray as xr
+    from aux_gps import get_all_possible_combinations_from_list
+    from aux_gps import save_ncfile
+    feats = get_all_possible_combinations_from_list(
+        ['pwv', 'pressure', 'doy'], reduce_single_list=True, combine_by_sep='+')
+    feat_list = []
+    for feat in feats:
+        print('Running CV on feature {}'.format(feat))
+        ds = CV_test_after_GridSearchCV(path=path, gr_path=gr_path,
+                                        model_name=model_name,
+                                        features=feat, PI=PI, Ptest=Ptest,
+                                        verbose=verbose, drop_hours=drop_hours)
+        feat_list.append(ds)
+    dsf = xr.concat(feat_list, 'features')
+    dsf['features'] = feats
+    dss = dsf
+    dss.attrs['model'] = model_name
+    if Ptest is not None:
+        filename = 'nested_CV_test_results_{}_all_features_with_hyper_permutation_tests.nc'.format(model_name)
+    else:
+        filename = 'nested_CV_test_results_{}_all_features_with_hyper.nc'.format(model_name)
+    if savepath is not None:
+        save_ncfile(dss, savepath, filename)
+    return dss
+
+
+def run_holdout_test_on_all_models_and_features(path=hydro_path, gr_path=hydro_ml_path/'holdout'):
+    import xarray as xr
+    from aux_gps import get_all_possible_combinations_from_list
+    feats = get_all_possible_combinations_from_list(
+        ['pwv', 'pressure', 'doy'], reduce_single_list=True, combine_by_sep='+')
+    models = ['MLP', 'SVC', 'RF']
+    model_list = []
+    model_list2 = []
+    for model in models:
+        feat_list = []
+        feat_list2 = []
+        for feat in feats:
+            best, roc = holdout_test(path=path, gr_path=gr_path,
+                                     model_name=model, features=feat)
+            best.index.name = 'scorer'
+            ds = best[['mean_score', 'std_score', 'holdout_test_scores']].to_xarray()
+            roc.index.name = 'FPR'
+            roc_da = roc.to_xarray().to_array('scorer')
+            feat_list.append(ds)
+            feat_list2.append(roc_da)
+        dsf = xr.concat(feat_list, 'features')
+        dsf2 = xr.concat(feat_list2, 'features')
+        dsf['features'] = feats
+        dsf2['features'] = feats
+        model_list.append(dsf)
+        model_list2.append(dsf2)
+    dss = xr.concat(model_list, 'model')
+    rocs = xr.concat(model_list2, 'model')
+    dss['model'] = models
+    rocs['model'] = models
+    dss['roc'] = rocs
+    return dss
+
+
+def prepare_X_y_for_holdout_test(features='pwv+doy', model_name='SVC',
+                                 path=hydro_path, drop_hours=None):
+    # combine X,y and split them according to test ratio and seed:
+    X, y = combine_pos_neg_from_nc_file(path)
+    # re arange X features according to model:
+    feats = features.split('+')
+    if model_name == 'RF' and 'doy' in feats:
+        if isinstance(feats, list):
+            feats.remove('doy')
+            feats.append('DOY')
+        elif isinstance(feats, str):
+            feats = 'DOY'
+    elif model_name != 'RF' and 'doy' in feats:
+        if isinstance(feats, list):
+            feats.remove('doy')
+            feats.append('doy_sin')
+            feats.append('doy_cos')
+        elif isinstance(feats, str):
+            feats = ['doy_sin']
+            feats.append('doy_cos')
+    X = select_features_from_X(X, feats)
+    if drop_hours is not None:
+        X = drop_hours_in_pwv_pressure_features(X, drop_hours, verbose=True)
+    return X, y
+
+
+def CV_test_after_GridSearchCV(path=hydro_path, gr_path=hydro_ml_path/'nested4',
+                               model_name='SVC', features='pwv',
+                               verbose=False, drop_hours=None, PI=None, Ptest=None):
+    """do cross_validate with all scorers on all gridsearchcv folds,
+    reads the nested outer splits CV file in gr_path"""
+    import xarray as xr
+    import numpy as np
+    cv = read_cv_params_and_instantiate(gr_path/'CV_outer.csv')
+    if verbose:
+        print(cv)
+    param_df_dict = load_one_gridsearchcv_object(path=gr_path,
+                                                 cv_type='nested',
+                                                 features=features,
+                                                 model_name=model_name,
+                                                 verbose=verbose)
+    X, y = prepare_X_y_for_holdout_test(features, model_name, path,
+                                        drop_hours=drop_hours)
+    if Ptest is not None:
+        ds = run_permutation_classifier_test(X, y, cv, param_df_dict, Ptest=Ptest,
+                                             model_name=model_name, verbose=verbose)
+        return ds
+    outer_bests = []
+    outer_rocs = []
+    fis = []
+    pi_means = []
+    pi_stds = []
+    for i, (train_index, test_index) in enumerate(cv.split(X, y)):
+        X_train = X[train_index]
+        y_train = y[train_index]
+        X_test = X[test_index]
+        y_test = y[test_index]
+        outer_split = '{}-{}'.format(i+1, cv.n_splits)
+        best_params_df = param_df_dict.get(outer_split)
+        if model_name == 'RF':
+            bdf, roc, fi, pi_mean, pi_std = run_test_on_CV_split(X_train, y_train, X_test, y_test,
+                                                                 best_params_df, PI=PI, Ptest=Ptest,
+                                                                 model_name=model_name, verbose=verbose)
+            fis.append(fi)
+        else:
+            bdf, roc, pi_mean, pi_std = run_test_on_CV_split(X_train, y_train, X_test, y_test,
+                                                             best_params_df, PI=PI,
+                                                             model_name=model_name, verbose=verbose)
+        pi_means.append(pi_mean)
+        pi_stds.append(pi_std)
+        bdf.index.name = 'scorer'
+        roc.index.name = 'FPR'
+        if 'hidden_layer_sizes' in bdf.columns:
+            bdf['hidden_layer_sizes'] = bdf['hidden_layer_sizes'].astype(str)
+        bdf_da = bdf.to_xarray()
+        roc_da = roc.to_xarray().to_array('scorer')
+        roc_da.name = 'TPR'
+        outer_bests.append(bdf_da)
+        outer_rocs.append(roc_da)
+    best_da = xr.concat(outer_bests, 'outer_split')
+    roc_da = xr.concat(outer_rocs, 'outer_split')
+    best = xr.merge([best_da, roc_da])
+    best['outer_split'] = np.arange(1, cv.n_splits + 1)
+    if model_name == 'RF':
+        fi_da = xr.concat(fis, 'outer_split')
+        best['feature_importances'] = fi_da
+    pi_mean_da = xr.concat(pi_means, 'outer_split')
+    pi_std_da = xr.concat(pi_stds, 'outer_split')
+    best['PI_mean'] = pi_mean_da
+    best['PI_std'] = pi_std_da
+    return best
+
+
+def run_permutation_classifier_test(X, y, cv, best_params_df, Ptest=100,
+                                    model_name='SVC', verbose=False):
+    from sklearn.model_selection import permutation_test_score
+    import xarray as xr
+    import numpy as np
+    ml = ML_Classifier_Switcher()
+    if verbose:
+        print('Picking {} model with best params'.format(model_name))
+    splits = []
+    for i, df in enumerate(best_params_df.values()):
+        if verbose:
+            print('running on split #{}'.format(i+1))
+        true_scores = []
+        pvals = []
+        perm_scores = []
+        for scorer in df.index:
+            sk_model = ml.pick_model(model_name)
+            # get best params (drop two last cols since they are not params):
+            params = df.T[scorer][:-2].to_dict()
+            if verbose:
+                print('{} scorer, params:{}'.format(scorer, params))
+            true, perm_scrs, pval = permutation_test_score(sk_model, X, y,
+                                                           cv=cv,
+                                                           n_permutations=Ptest,
+                                                           scoring=scorers(scorer),
+                                                           random_state=0,
+                                                           n_jobs=-1)
+            true_scores.append(true)
+            pvals.append(pval)
+            perm_scores.append(perm_scrs)
+        true_da = xr.DataArray(true_scores, dims=['scorer'])
+        true_da['scorer'] = [x for x in df.index.values]
+        true_da.name = 'true_score'
+        pval_da = xr.DataArray(pvals, dims=['scorer'])
+        pval_da['scorer'] = [x for x in df.index.values]
+        pval_da.name = 'pvalue'
+        perm_da = xr.DataArray(perm_scores, dims=['scorer', 'permutations'])
+        perm_da['scorer'] = [x for x in df.index.values]
+        perm_da['permutations'] = np.arange(1, Ptest+1)
+        perm_da.name = 'permutation_score'
+        ds = xr.merge([true_da, pval_da, perm_da])
+        splits.append(ds)
+    dss = xr.concat(splits, dim='outer_split')
+    dss['outer_split'] = np.arange(1, len(best_params_df)+ 1)
+    return dss
+
+
+def run_test_on_CV_split(X_train, y_train, X_test, y_test, param_df,
+                         model_name='SVC', verbose=False, PI=None,
+                         Ptest=None):
+    import numpy as np
+    import xarray as xr
+    import pandas as pd
+    from sklearn.metrics import roc_curve
+    from sklearn.metrics import roc_auc_score
+    from sklearn.inspection import permutation_importance
+    best_df = param_df.copy()
+    ml = ML_Classifier_Switcher()
+    if verbose:
+        print('Picking {} model with best params'.format(model_name))
+    # print('Features are: {}'.format(features))
+    test_scores = []
+    fi_list = []
+    mean_fpr = np.linspace(0, 1, 100)
+    tprs = []
+    roc_aucs = []
+    pi_mean_list = []
+    pi_std_list = []
+    for scorer in best_df.index:
+        sk_model = ml.pick_model(model_name)
+        # get best params (drop two last cols since they are not params):
+        params = best_df.T[scorer][:-2].to_dict()
+        if verbose:
+            print('{} scorer, params:{}'.format(scorer, params))
+        sk_model.set_params(**params)
+        sk_model.fit(X_train, y_train)
+        if hasattr(sk_model, 'feature_importances_'):
+            FI = xr.DataArray(sk_model.feature_importances_, dims=['feature'])
+            FI['feature'] = X_train['feature']
+            fi_list.append(FI)
+        y_pred = sk_model.predict(X_test)
+        fpr, tpr, _ = roc_curve(y_test, y_pred)
+        interp_tpr = np.interp(mean_fpr, fpr, tpr)
+        interp_tpr[0] = 0.0
+        roc_auc = roc_auc_score(y_test, y_pred)
+        roc_aucs.append(roc_auc)
+        tprs.append(interp_tpr)
+        score = scorer_function(scorer, y_test, y_pred)
+        test_scores.append(score)
+        pi = permutation_importance(sk_model, X_test, y_test,
+                                    n_repeats=PI,
+                                    scoring=scorers(scorer),
+                                    random_state=0, n_jobs=-1)
+        pi_mean = xr.DataArray(pi['importances_mean'], dims='feature')
+        pi_std = xr.DataArray(pi['importances_std'], dims='feature')
+        pi_mean.name = 'PI_mean'
+        pi_std.name = 'PI_std'
+        pi_mean['feature'] = X_train['feature']
+        pi_std['feature'] = X_train['feature']
+        pi_mean_list.append(pi_mean)
+        pi_std_list.append(pi_std)
+    pi_mean_da = xr.concat(pi_mean_list, 'scorer')
+    pi_std_da = xr.concat(pi_std_list, 'scorer')
+    pi_mean_da['scorer'] = [x for x in best_df.index.values]
+    pi_std_da['scorer'] = [x for x in best_df.index.values]
+    roc_df = pd.DataFrame(tprs).T
+    roc_df.columns = [x for x in best_df.index]
+    roc_df.index = mean_fpr
+    best_df['test_score'] = test_scores
+    best_df['roc_auc_score'] = roc_aucs
+    if hasattr(sk_model, 'feature_importances_'):
+        fi = xr.concat(fi_list, 'scorer')
+        fi['scorer'] = [x for x in best_df.index.values]
+        return best_df, roc_df, fi, pi_mean_da, pi_std_da
+    elif PI is not None:
+        return best_df, roc_df, pi_mean_da, pi_std_da
+    else:
+        return best_df, roc_df
+
+
+def holdout_test(path=hydro_path, gr_path=hydro_ml_path/'holdout',
+                 model_name='SVC', features='pwv', return_RF_FI=False,
+                 verbose=False):
+    """do a holdout test with best model from gridsearchcv
+    with all scorers"""
+    from sklearn.model_selection import train_test_split
+    from sklearn.metrics import roc_curve
+    from sklearn.metrics import roc_auc_score
+    import xarray as xr
+    import pandas as pd
+    import numpy as np
+    # process gridsearchcv results:
+    best_df, test_ratio, seed = load_one_gridsearchcv_object(path=gr_path,
+                                                             cv_type='holdout',
+                                                             features=features,
+                                                             model_name=model_name,
+                                                             verbose=False)
+    print('Using random seed of {} and {}% test ratio'.format(seed, test_ratio))
+    ts = int(test_ratio) / 100
+    X, y = prepare_X_y_for_holdout_test(features, model_name, path)
+    # split using test_size and seed:
+    X_train, X_test, y_train, y_test = train_test_split(X, y,
+                                                        test_size=ts,
+                                                        random_state=int(seed),
+                                                        stratify=y)
+    if verbose:
+        print('y train pos/neg:{}, {}'.format((y_train==1).sum().item(),(y_train==0).sum().item()))
+        print('y test pos/neg:{}, {}'.format((y_test==1).sum().item(),(y_test==0).sum().item()))
+    # pick model and set the params to best from gridsearchcv:
+    ml = ML_Classifier_Switcher()
+    print('Picking {} model with best params'.format(model_name))
+    print('Features are: {}'.format(features))
+    test_scores = []
+    fi_list = []
+    mean_fpr = np.linspace(0, 1, 100)
+    tprs = []
+    roc_aucs = []
+    for scorer in best_df.index:
+        sk_model = ml.pick_model(model_name)
+        # get best params (drop two last cols since they are not params):
+        params = best_df.T[scorer][:-2].to_dict()
+        if verbose:
+            print('{} scorer, params:{}'.format(scorer, params))
+        sk_model.set_params(**params)
+        sk_model.fit(X_train, y_train)
+        if hasattr(sk_model, 'feature_importances_'):
+            FI = xr.DataArray(sk_model.feature_importances_, dims=['feature'])
+            FI['feature'] = X_train['feature']
+            fi_list.append(FI)
+        y_pred = sk_model.predict(X_test)
+        fpr, tpr, _ = roc_curve(y_test, y_pred)
+        interp_tpr = np.interp(mean_fpr, fpr, tpr)
+        interp_tpr[0] = 0.0
+        roc_auc = roc_auc_score(y_test, y_pred)
+        roc_aucs.append(roc_auc)
+        tprs.append(interp_tpr)
+        score = scorer_function(scorer, y_test, y_pred)
+        test_scores.append(score)
+    roc_df = pd.DataFrame(tprs).T
+    roc_df.columns = [x for x in best_df.index]
+    roc_df.index = mean_fpr
+    best_df['holdout_test_scores'] = test_scores
+    best_df['roc_auc_score'] = roc_aucs
+    if fi_list and return_RF_FI:
+        da = xr.concat(fi_list, 'scorer')
+        da['scorer'] = best_df.index.values
+        da.name = 'RF_feature_importances'
+        return da
+    return best_df, roc_df
+
+
+def load_one_gridsearchcv_object(path=hydro_ml_path, cv_type='holdout', features='pwv',
+                                 model_name='SVC', verbose=True):
+    """load one gridsearchcv obj with model_name and features and run read_one_gridsearchcv_object"""
+    from aux_gps import path_glob
+    import joblib
+    # first filter for model name:
+    if verbose:
+        print('loading GridsearchCVs results for {} model with {} cv type'.format(model_name, cv_type))
+    model_files = path_glob(path, 'GRSRCHCV_{}_*.pkl'.format(cv_type))
+    model_files = [x for x in model_files if model_name in x.as_posix()]
+    # now select features:
+    if verbose:
+        print('loading GridsearchCVs results with {} features'.format(features))
+    model_features = [x.as_posix().split('/')[-1].split('_')[3] for x in model_files]
+    feat_ind = get_feature_set_from_list(model_features, features)
+    # also get the test ratio and seed number:
+    if len(feat_ind) > 1:
+        if verbose:
+            print('found {} GR objects.'.format(len(feat_ind)))
+        files = sorted([model_files[x] for x in feat_ind])
+        outer_splits = [x.as_posix().split('/')[-1].split('.')[0].split('_')[-3] for x in files]
+        grs = [joblib.load(x) for x in files]
+        best_dfs = [read_one_gridsearchcv_object(x) for x in grs]
+        di = dict(zip(outer_splits, best_dfs))
+        return di
+    else:
+        file = model_files[feat_ind]
+        seed = file.as_posix().split('/')[-1].split('.')[0].split('_')[-1]
+        outer_splits = file.as_posix().split('/')[-1].split('.')[0].split('_')[-3]
+    # load and produce best_df:
+        gr = joblib.load(file)
+        best_df = read_one_gridsearchcv_object(gr)
+        return best_df, outer_splits, seed
+
+
+def get_feature_set_from_list(model_features_list, features, sep='+'):
+    """select features from model_features_list,
+    return the index in the model_features_list and the entry itself"""
+    # first find if features is a single or multiple features:
+    if isinstance(features, str) and sep not in features:
+        try:
+            ind = [i for i, e in enumerate(model_features_list) if e == features]
+            # ind = model_features_list.index(features)
+        except ValueError:
+            raise ValueError('{} is not in {}'.format(features, ', '.join(model_features_list)))
+    elif isinstance(features, str) and sep in features:
+        features_split = features.split(sep)
+        mf = [x.split(sep) for x in model_features_list]
+        bool_list = [set(features_split) == (set(x)) for x in mf]
+        ind = [i for i, x in enumerate(bool_list) if x]
+        # print(len(ind))
+        # ind = ind[0]
+        # feat = model_features_list[ind]
+    # feat = model_features_list[ind]
+    return ind
+
+
+def read_one_gridsearchcv_object(gr):
+    """read one gridsearchcv multimetric object and
+    get the best params, best mean/std scores"""
+    import pandas as pd
+    # param grid dict:
+    params = gr.param_grid
+    # scorer names:
+    scoring = [x for x in gr.scoring.keys()]
+    # df:
+    df = pd.DataFrame().from_dict(gr.cv_results_)
+    # produce multiindex from param_grid dict:
+    param_names = [x for x in params.keys()]
+    # unpack param_grid vals to list of lists:
+    pro = [[y for y in x] for x in params.values()]
+    ind = pd.MultiIndex.from_product((pro), names=param_names)
+    df.index = ind
+    best_params = []
+    best_mean_scores = []
+    best_std_scores = []
+    for scorer in scoring:
+        best_params.append(df[df['rank_test_{}'.format(scorer)]==1]['mean_test_{}'.format(scorer)].index[0])
+        best_mean_scores.append(df[df['rank_test_{}'.format(scorer)]==1]['mean_test_{}'.format(scorer)].iloc[0])
+        best_std_scores.append(df[df['rank_test_{}'.format(scorer)]==1]['std_test_{}'.format(scorer)].iloc[0])
+    best_df = pd.DataFrame(best_params, index=scoring, columns=param_names)
+    best_df['mean_score'] = best_mean_scores
+    best_df['std_score'] = best_std_scores
+    return best_df
+
+
 def process_gridsearch_results(GridSearchCV, model_name,
                                split_dim='inner_kfold', features=None,
                                pwv_id=None, hs_id=None, test_size=None):
     import xarray as xr
     import pandas as pd
     import numpy as np
+    # finish getting best results from all scorers togather
     """takes GridSreachCV object with cv_results and xarray it into dataarray"""
     params = GridSearchCV.param_grid
     scoring = GridSearchCV.scoring
+    results = GridSearchCV.cv_results_
+    # for scorer in scoring:
+    #     for sample in ['train', 'test']:
+    #         sample_score_mean = results['mean_{}_{}'.format(sample, scorer)]
+    #         sample_score_std = results['std_{}_{}'.format(sample, scorer)]
+    #     best_index = np.nonzero(results['rank_test_{}'.format(scorer)] == 1)[0][0]
+    #     best_score = results['mean_test_{}'.format(scorer)][best_index]
     names = [x for x in params.keys()]
 
     # unpack param_grid vals to list of lists:
@@ -1610,10 +2783,10 @@ def process_gridsearch_results(GridSearchCV, model_name,
 #                        not in x and 'time' not in x and 'param' not in x and
 #                        'rank' not in x]
     result_names = [
-        x for x in GridSearchCV.cv_results_.keys() if 'param' not in x]
+        x for x in results.keys() if 'param' not in x]
     ds = xr.Dataset()
     for da_name in result_names:
-        da = xr.DataArray(GridSearchCV.cv_results_[da_name])
+        da = xr.DataArray(results[da_name])
         ds[da_name] = da
     ds = ds.assign(dim_0=ind).unstack('dim_0')
     for dim in ds.dims:
@@ -1673,7 +2846,7 @@ def process_gridsearch_results(GridSearchCV, model_name,
             ds['best_{}'.format(name)] = GridSearchCV.best_params_[name]
         return ds, GridSearchCV.best_estimator_
     else:
-        return ds
+        return ds, None
 
 
 def save_cv_results(cvr, savepath=hydro_path):
@@ -2787,16 +3960,26 @@ def read_tides(path=hydro_path):
         df['tide_start'] = pd.to_datetime(
             df['tide_start_date'], dayfirst=True) + pd.to_timedelta(
             df['tide_start_hour'].add(':00'), unit='m', errors='coerce')
+        # tides are in local Israeli winter clock (no DST):
+        # dst = np.zeros(df['tide_start'].shape)
+        # df['tide_start'] = df['tide_start'].dt.tz_localize('Asia/Jerusalem', ambiguous=dst).dt.tz_convert('UTC')
+        df['tide_start'] = df['tide_start'] - pd.Timedelta(2, unit='H')
         df['tide_end'] = pd.to_datetime(
             df['tide_end_date'], dayfirst=True) + pd.to_timedelta(
             df['tide_end_hour'].add(':00'),
             unit='m',
             errors='coerce')
+        # also to tide ends:
+        df['tide_end'] = df['tide_end'] - pd.Timedelta(2, unit='H')
+        # df['tide_end'] = df['tide_end'].dt.tz_localize('Asia/Jerusalem', ambiguous=dst).dt.tz_convert('UTC')
         df['tide_max'] = pd.to_datetime(
             df['tide_max_date'], dayfirst=True) + pd.to_timedelta(
             df['tide_max_hour'].add(':00'),
             unit='m',
             errors='coerce')
+        # also to tide max:
+        # df['tide_max'] = df['tide_max'].dt.tz_localize('Asia/Jerusalem', ambiguous=dst).dt.tz_convert('UTC')
+        df['tide_max'] = df['tide_max'] - pd.Timedelta(2, unit='H')
         df['tide_duration'] = pd.to_timedelta(
             df['tide_duration'] + ':00', unit='m', errors='coerce')
         df.loc[:,
@@ -2861,6 +4044,7 @@ def read_tides(path=hydro_path):
     dsu = [get_unique_index(x, dim='tide_start') for x in ds_list]
     print('merging...')
     ds = xr.merge(dsu)
+    ds.attrs['time'] = 'UTC'
     filename = 'hydro_tides.nc'
     print('saving {} to {}'.format(filename, path))
     comp = dict(zlib=True, complevel=9)  # best compression
@@ -2927,7 +4111,8 @@ def read_hydrographs(path=hydro_path):
             'flow_type',
             'record_type',
             'record_code']
-        df['time'] = pd.to_datetime(df['time'], dayfirst=True)
+        # make sure the time is in UTC since database is in ISR winter clock (no DST)
+        df['time'] = pd.to_datetime(df['time'], dayfirst=True) - pd.Timedelta(2, unit='H')
         df['tide_height[m]'] = df['tide_height[m]'].astype(float)
         df['flow[m^3/sec]'] = df['flow[m^3/sec]'].astype(float)
         df.loc[:, 'data_type'][df['data_type'].str.contains(
@@ -2980,6 +4165,7 @@ def read_hydrographs(path=hydro_path):
     dsu = [get_unique_index(x) for x in ds_list]
     print('merging...')
     ds = xr.merge(dsu)
+    ds.attrs['time'] = 'UTC'
     filename = 'hydro_graphs.nc'
     print('saving {} to {}'.format(filename, path))
     comp = dict(zlib=True, complevel=9)  # best compression
@@ -3040,6 +4226,34 @@ def check_if_tide_events_from_stations_are_within_time_window(df_list, rounding=
     else:
         return df
 
+
+def scorers(scorer_str):
+    from sklearn.metrics import make_scorer
+    if scorer_str == 'tss':
+        return make_scorer(tss_score)
+    elif scorer_str == 'hss':
+        return make_scorer(hss_score)
+    else:
+        return scorer_str
+
+def scorer_function(scorer_label, y_true, y_pred):
+    import sklearn.metrics as sm
+    if scorer_label == 'precision':
+        return sm.precision_score(y_true, y_pred)
+    elif scorer_label == 'recall':
+        return sm.recall_score(y_true, y_pred)
+    elif scorer_label == 'f1':
+        return sm.f1_score(y_true, y_pred)
+    elif scorer_label == 'accuracy':
+        return sm.accuracy_score(y_true, y_pred)
+    elif scorer_label == 'tss':
+        return tss_score(y_true, y_pred)
+    elif scorer_label == 'hss':
+        return hss_score(y_true, y_pred)
+    else:
+        raise('{} is not implemented yet'.format(scorer_label))
+
+
 def acc_score(y_true, y_pred):
     from sklearn.metrics import accuracy_score
     return accuracy_score(y_true, y_pred)
@@ -3077,9 +4291,14 @@ def hss_score(y, y_pred, **kwargs):
     return hss
 
 
+def order_of_mag(minimal=-5, maximal=1):
+    import numpy as np
+    return [10**float(x) for x in np.arange(minimal, maximal + 1)]
+
+
 class ML_Classifier_Switcher(object):
 
-    def pick_model(self, model_name, light=False):
+    def pick_model(self, model_name, pgrid='normal'):
         """Dispatch method"""
         # from sklearn.model_selection import GridSearchCV
         self.param_grid = None
@@ -3092,54 +4311,73 @@ class ML_Classifier_Switcher(object):
 #        else:
         # Call the method as we return it
         # whether to select lighter param grid, e.g., for testing purposes.
-        self.light = light
+        self.pgrid = pgrid
         return method()
 
     def SVC(self):
         from sklearn.svm import SVC
         import numpy as np
-        if self.light:
+        if self.pgrid == 'light':
             self.param_grid = {'kernel': ['rbf', 'sigmoid', 'linear', 'poly'],
                                'C': [0.1, 100],
                                'gamma': [0.0001, 1],
                                'degree': [1, 2, 5],
                                'coef0': [0, 1, 4]}
-        else:
+        elif self.pgrid == 'normal':
             self.param_grid = {'kernel': ['rbf', 'sigmoid', 'linear', 'poly'],
-                               'C': np.logspace(-1, 2, 10),
-                               'gamma': np.logspace(-5, 0, 15),
+                               'C': order_of_mag(-1, 2),
+                               'gamma': order_of_mag(-5, 0),
                                'degree': [1, 2, 3, 4, 5],
                                'coef0': [0, 1, 2, 3, 4]}
-        return SVC(random_state=42, class_weight='balanced')
+        elif self.pgrid == 'dense':
+            self.param_grid = {'kernel': ['rbf', 'sigmoid', 'linear', 'poly'],
+                               'C': order_of_mag(-2, 2),
+                               'gamma': order_of_mag(-5, 0),
+                               'degree': [1, 2, 3, 4, 5],
+                               'coef0': [0, 1, 2, 3, 4]}
+        return SVC(random_state=42, class_weight=None)
 
     def MLP(self):
         import numpy as np
         from sklearn.neural_network import MLPClassifier
-        if self.light:
+        if self.pgrid == 'light':
             self.param_grid = {
                 'activation': [
                     'identity',
                     'relu'],
                 'hidden_layer_sizes': [(50, 50, 50), (50, 100, 50)]}
-        else:
-            self.param_grid = {'alpha': np.logspace(-5, 1, 15),
+        elif self.pgrid == 'normal':
+            self.param_grid = {'alpha': order_of_mag(-5, 1),
                                'activation': ['identity', 'logistic', 'tanh', 'relu'],
                                'hidden_layer_sizes': [(50, 50, 50), (50, 100, 50), (100,)],
                                'learning_rate': ['constant', 'adaptive'],
                                'solver': ['adam', 'lbfgs', 'sgd']}
-        return MLPClassifier(random_state=42, max_iter=500)
+        elif self.pgrid == 'dense':
+            self.param_grid = {'alpha': order_of_mag(-5, 1),
+                               'activation': ['identity', 'logistic', 'tanh', 'relu'],
+                               'hidden_layer_sizes': [(50, 50, 50), (50, 100, 50), (100,)],
+                               'learning_rate': ['constant', 'adaptive'],
+                               'solver': ['adam', 'lbfgs', 'sgd']}
+        return MLPClassifier(random_state=42, max_iter=2000)
 
     def RF(self):
         from sklearn.ensemble import RandomForestClassifier
         import numpy as np
-        if self.light:
+        if self.pgrid == 'light':
             self.param_grid = {'max_features': ['auto', 'sqrt']}
-        else:
+        elif self.pgrid == 'normal':
             self.param_grid = {'max_depth': [5, 10, 25, 50, 100],
                                'max_features': ['auto', 'sqrt'],
                                'min_samples_leaf': [1, 2, 5, 10],
                                'min_samples_split': [2, 5, 15, 50],
                                'n_estimators': [100, 300, 700, 1200]
                                }
+        elif self.pgrid == 'dense':
+            self.param_grid = {'max_depth': [5, 10, 25, 50, 100, 150, 250],
+                               'max_features': ['auto', 'sqrt'],
+                               'min_samples_leaf': [1, 2, 5, 10, 15, 25],
+                               'min_samples_split': [2, 5, 15, 30, 50, 70, 100],
+                               'n_estimators': [100, 200, 300, 500, 700, 1000, 1300, 1500]
+                               }
         return RandomForestClassifier(random_state=42, n_jobs=-1,
-                                      class_weight='balanced')
+                                      class_weight=None)
